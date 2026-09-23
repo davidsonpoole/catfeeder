@@ -1,0 +1,20 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# clangd / IDE caches
+.cache/
+.clangd
+compile_commands.json
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+
+# Secrets
+wifi_secrets.h
+*secrets.h
+.env
