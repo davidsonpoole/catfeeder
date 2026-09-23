@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Daily clock sync for the cat feeder.
+
+     Install:
+       cp tools/catfeeder-timesync.plist ~/Library/LaunchAgents/local.catfeeder.timesync.plist
+       # edit the script path below to match this checkout, then:
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.catfeeder.timesync.plist
+
+     Runs every day at 09:00. RunAtLoad plus launchd's catch-up behaviour means
+     a sync also happens when the laptop wakes up having missed the slot. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.catfeeder.timesync</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/davidson/git/self/catfeeder/tools/sync-time.sh</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/catfeeder-timesync.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/catfeeder-timesync.log</string>
+</dict>
+</plist>
