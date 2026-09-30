@@ -55,9 +55,12 @@ below. A clock synced more than 14 days ago is flagged `[STALE]`.
 ### The schedule
 
 Meals are a time of day plus a portion count, up to 8 of them, kept in flash.
-They are addressed by their position in the list, which means **deleting a meal
-renumbers the ones after it** — run `catfeeder meals` between edits rather than
-working from a stale listing.
+The schedule is always in time order, so adding a meal, or editing one's time,
+drops it into place rather than onto the end.
+
+Meals are addressed by their position in that order, which means **any edit can
+renumber the others** — run `catfeeder meals` between edits rather than working
+from a stale listing.
 
 A meal already served today stays served, so moving its time later in the day
 does not feed the cat twice. If a write reaches the schedule but not flash, the

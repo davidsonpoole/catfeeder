@@ -238,16 +238,16 @@ def cmd_meals(args):
 def cmd_meal_add(args):
     data = request(args, "POST", "/api/meals",
                    {"timeOfDay": args.at, "portions": args.portions})
-    show(args, data, ["added meal [{}]: {}  {}{}".format(
-        data["index"], fmt_minutes(data["meal"]["timeOfDay"]),
+    show(args, data, ["added {}  {}{}".format(
+        fmt_minutes(data["meal"]["timeOfDay"]),
         fmt_portions(data["meal"]["portions"]), unsaved(data))])
 
 
 def cmd_meal_set(args):
     data = request(args, "PUT", "/api/meals/{}".format(args.index),
                    {"timeOfDay": args.at, "portions": args.portions})
-    show(args, data, ["meal [{}] is now {}  {}{}".format(
-        data["index"], fmt_minutes(data["meal"]["timeOfDay"]),
+    show(args, data, ["meal {} is now {}  {}{}".format(
+        args.index, fmt_minutes(data["meal"]["timeOfDay"]),
         fmt_portions(data["meal"]["portions"]), unsaved(data))])
 
 

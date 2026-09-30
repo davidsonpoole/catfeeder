@@ -80,6 +80,32 @@ Preferences prefs;
 Meal meals[MAX_MEALS];
 int numMeals = 0;
 
+// The schedule is kept in time order, so it reads like a timetable and the
+// indices the API hands out follow the clock. Inserting into place is enough to
+// keep it that way, and walking back over equal times leaves meals that share a
+// time in the order they were added. Returns where the meal landed.
+static int insertMeal(const Meal& meal) {
+    int at = numMeals;
+    while (at > 0 && meals[at - 1].timeOfDay > meal.timeOfDay) at--;
+
+    for (int i = numMeals; i > at; i--) {
+        meals[i] = meals[i - 1];
+    }
+
+    meals[at] = meal;
+    numMeals++;
+    return at;
+}
+
+// Drops a meal, closing the gap so the order is preserved and no stale copy is
+// left past the end of the list.
+static void removeMeal(int index) {
+    for (int i = index; i < numMeals - 1; i++) {
+        meals[i] = meals[i + 1];
+    }
+    numMeals--;
+}
+
 // Writes the schedule to flash. Returns false if it did not stick, so the
 // caller can tell the client its change will not survive a reboot.
 static bool saveSchedule() {
@@ -143,10 +169,11 @@ static void loadSchedule() {
             continue;
         }
 
-        meals[numMeals].portions = stored[i].portions;
-        meals[numMeals].timeOfDay = stored[i].timeOfDay;
-        meals[numMeals].lastFiredDay = MEAL_NEVER_FIRED;
-        numMeals++;
+        Meal meal;
+        meal.portions = stored[i].portions;
+        meal.timeOfDay = stored[i].timeOfDay;
+        meal.lastFiredDay = MEAL_NEVER_FIRED;
+        insertMeal(meal);  // a schedule saved before meals were ordered
     }
 
     Serial.printf("Restored %d meal(s) from flash\n", numMeals);
@@ -423,13 +450,13 @@ void handleAddMeal() {
     Meal meal;
     if (!mealFromJson(doc.as<JsonObjectConst>(), meal)) return;
 
-    meals[numMeals++] = meal;
+    int index = insertMeal(meal);
     armSchedule();  // don't serve a meal whose time passed before it existed
     bool persisted = saveSchedule();
-    Serial.printf("Added meal: %d portions at %d\n", meal.portions, meal.timeOfDay);
+    Serial.printf("Added meal %d: %d portions at %d\n", index, meal.portions, meal.timeOfDay);
 
     JsonDocument res;
-    res["index"] = numMeals - 1;
+    res["index"] = index;
     res["persisted"] = persisted;
     mealToJson(meal, res["meal"].to<JsonObject>());
     sendJson(201, res);
@@ -452,13 +479,18 @@ void handleChangeMeal() {
         meal.lastFiredDay = meals[index].lastFiredDay;
     }
 
-    meals[index] = meal;
+    // A new time belongs somewhere else in the schedule, so the meal moves and
+    // the index in the response is not necessarily the one that was asked for.
+    removeMeal(index);
+    int newIndex = insertMeal(meal);
+
     armSchedule();
     bool persisted = saveSchedule();
-    Serial.printf("Changed meal %d: %d portions at %d\n", index, meal.portions, meal.timeOfDay);
+    Serial.printf("Changed meal %d: %d portions at %d (now meal %d)\n", index, meal.portions,
+                  meal.timeOfDay, newIndex);
 
     JsonDocument res;
-    res["index"] = index;
+    res["index"] = newIndex;
     res["persisted"] = persisted;
     mealToJson(meal, res["meal"].to<JsonObject>());
     sendJson(200, res);
@@ -470,11 +502,7 @@ void handleDeleteMeal() {
     if (index < 0) return;
 
     Meal removed = meals[index];
-
-    for (int i = index; i < numMeals - 1; i++) {
-        meals[i] = meals[i + 1];
-    }
-    numMeals--;
+    removeMeal(index);
 
     bool persisted = saveSchedule();
     Serial.printf("Deleted meal %d\n", index);
