@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""Command line client for the cat feeder.
+
+The feeder speaks JSON over HTTP on port 80 (see src/main.cpp). This wraps that
+API so the curl incantations live in the repo instead of in shell history.
+
+The host comes from --host, else $CATFEEDER_HOST, else the default below.
+
+    catfeeder status             what is on the schedule, and is the clock set
+    catfeeder feed 2             dispense two portions now
+    catfeeder sync-time          push this computer's clock to the feeder
+    catfeeder meals add 07:30 2  feed two portions at 07:30 every day
+"""
+
+import argparse
+import json
+import os
+import socket
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+DEFAULT_HOST = "192.168.1.244"
+
+# Mirrors of the firmware's limits, so bad input is rejected here with a clearer
+# message than the 400 the feeder would send back.
+MAX_PORTIONS = 10
+MINUTES_PER_DAY = 1440
+PORTION_TIMEOUT_MS = 10000
+PORTION_TIMEOUT_MAX_MS = 60000
+
+
+# ---------------------------------------------------------------- plumbing
+
+
+class FeederError(Exception):
+    """A request the feeder refused, or could not be made at all."""
+
+
+def die(message):
+    print("catfeeder: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def request(args, method, path, body=None, params=None, timeout=10):
+    """Calls the feeder and returns the decoded JSON response."""
+    url = "http://{}{}".format(args.host, path)
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+
+    data = None
+    headers = {}
+    if body is not None:
+        data = json.dumps(body).encode()
+        # A JSON body only reaches the firmware's readBody() when the request
+        # does not look like a form, so this header is not optional.
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as err:
+        raise FeederError("{} {}: {}".format(err.code, err.reason, http_error_detail(err)))
+    except urllib.error.URLError as err:
+        raise FeederError("cannot reach {}: {}".format(args.host, err.reason))
+    except socket.timeout:  # an alias of TimeoutError only from Python 3.10
+        raise FeederError("timed out talking to {}".format(args.host))
+
+    return json.loads(raw) if raw else {}
+
+
+def http_error_detail(err):
+    """Pulls the firmware's {"error": ...} message out of a failed response."""
+    try:
+        body = json.loads(err.read())
+    except Exception:
+        return "no details"
+    return body.get("error", json.dumps(body))
+
+
+def show(args, data, lines):
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return
+    for line in lines:
+        print(line)
+
+
+# ---------------------------------------------------------------- formatting
+
+
+def parse_time_of_day(text):
+    """Accepts "7:30", "07:30" or a raw minute-of-day such as "450"."""
+    if ":" in text:
+        hh, _, mm = text.partition(":")
+        try:
+            minutes = int(hh) * 60 + int(mm)
+        except ValueError:
+            raise argparse.ArgumentTypeError("not a time: {!r}".format(text))
+    else:
+        try:
+            minutes = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError("not a time: {!r}".format(text))
+
+    if not 0 <= minutes < MINUTES_PER_DAY:
+        raise argparse.ArgumentTypeError("time out of range: {!r}".format(text))
+    return minutes
+
+
+def portions_arg(text):
+    try:
+        portions = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("not a number: {!r}".format(text))
+    if not 1 <= portions <= MAX_PORTIONS:
+        raise argparse.ArgumentTypeError(
+            "portions must be between 1 and {}".format(MAX_PORTIONS))
+    return portions
+
+
+def bounded_int(low, high, unit="ms"):
+    """Builds an argparse type that keeps to one of the firmware's ranges."""
+    def parse(text):
+        try:
+            value = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError("not a number: {!r}".format(text))
+        if not low <= value <= high:
+            raise argparse.ArgumentTypeError(
+                "must be between {} and {} {}".format(low, high, unit))
+        return value
+    return parse
+
+
+def fmt_minutes(minutes):
+    return "{:02d}:{:02d}".format(minutes // 60, minutes % 60)
+
+
+def fmt_offset(minutes):
+    sign = "-" if minutes < 0 else "+"
+    minutes = abs(minutes)
+    return "{}{:02d}:{:02d}".format(sign, minutes // 60, minutes % 60)
+
+
+def fmt_age(seconds):
+    if seconds < 60:
+        return "{}s".format(seconds)
+    if seconds < 3600:
+        return "{}m".format(seconds // 60)
+    if seconds < 86400:
+        return "{}h {}m".format(seconds // 3600, (seconds % 3600) // 60)
+    return "{}d {}h".format(seconds // 86400, (seconds % 86400) // 3600)
+
+
+def fmt_portions(n):
+    return "1 portion" if n == 1 else "{} portions".format(n)
+
+
+def clock_lines(clock):
+    if not clock.get("synced"):
+        return ["clock:  NOT SYNCED - the feeder will not feed until it is"
+                " (run: catfeeder sync-time)"]
+
+    line = "clock:  local {}, UTC{}, synced {} ago".format(
+        fmt_minutes(clock["localMinuteOfDay"]),
+        fmt_offset(clock.get("tzOffsetMinutes", 0)),
+        fmt_age(clock.get("secondsSinceSync", 0)))
+    if clock.get("stale"):
+        line += "  [STALE]"
+    return [line]
+
+
+def meal_lines(meals):
+    if not meals:
+        return ["meals:  none scheduled"]
+
+    lines = ["meals:  {} scheduled".format(len(meals))]
+    for index, meal in enumerate(meals):
+        lines.append("  [{}] {}  {}".format(
+            index, fmt_minutes(meal["timeOfDay"]), fmt_portions(meal["portions"])))
+    return lines
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_status(args):
+    data = request(args, "GET", "/api/settings")
+    show(args, data, clock_lines(data.get("clock", {})) + meal_lines(data.get("meals", [])))
+
+
+def cmd_feed(args):
+    body = {"portions": args.portions}
+    if args.timeout is not None:
+        body["timeout"] = args.timeout
+
+    # The feeder runs the motor before answering, so allow for the worst case.
+    per_portion = (args.timeout or PORTION_TIMEOUT_MS) / 1000
+    data = request(args, "POST", "/api/dispense", body,
+                   timeout=args.portions * per_portion + 10)
+
+    complete = data.get("complete")
+    lines = ["dispensed {} of {}".format(data["served"], data["requested"])]
+    if not complete:
+        lines.append("the sensor did not count every portion - check for a jam")
+    show(args, data, lines)
+
+    if not complete:
+        raise SystemExit(1)
+
+
+def cmd_time(args):
+    data = request(args, "GET", "/api/time")
+    show(args, data, clock_lines(data))
+
+
+def cmd_sync_time(args):
+    now = time.time()
+    offset = -round(
+        (time.altzone if time.localtime(now).tm_isdst and time.daylight
+         else time.timezone) / 60)
+
+    data = request(args, "POST", "/api/time",
+                   {"epoch": int(now), "tzOffsetMinutes": offset})
+    show(args, data, clock_lines(data))
+
+
+def cmd_meals(args):
+    data = request(args, "GET", "/api/meals")
+    show(args, data, meal_lines(data.get("meals", [])))
+
+
+def cmd_meal_add(args):
+    data = request(args, "POST", "/api/meals",
+                   {"timeOfDay": args.at, "portions": args.portions})
+    show(args, data, ["added meal [{}]: {}  {}{}".format(
+        data["index"], fmt_minutes(data["meal"]["timeOfDay"]),
+        fmt_portions(data["meal"]["portions"]), unsaved(data))])
+
+
+def cmd_meal_set(args):
+    data = request(args, "PUT", "/api/meals/{}".format(args.index),
+                   {"timeOfDay": args.at, "portions": args.portions})
+    show(args, data, ["meal [{}] is now {}  {}{}".format(
+        data["index"], fmt_minutes(data["meal"]["timeOfDay"]),
+        fmt_portions(data["meal"]["portions"]), unsaved(data))])
+
+
+def cmd_meal_rm(args):
+    data = request(args, "DELETE", "/api/meals/{}".format(args.index))
+    show(args, data, ["removed {}  {}{}".format(
+        fmt_minutes(data["meal"]["timeOfDay"]),
+        fmt_portions(data["meal"]["portions"]), unsaved(data))])
+
+
+def unsaved(data):
+    """Flags a schedule change that did not make it to flash."""
+    return "" if data.get("persisted", True) else "  [NOT SAVED to flash]"
+
+
+# ---------------------------------------------------------------- arguments
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="catfeeder", description="Talk to the cat feeder over its HTTP API.")
+    parser.add_argument("--host", default=os.environ.get("CATFEEDER_HOST", DEFAULT_HOST),
+                        help="feeder address (default: $CATFEEDER_HOST or " + DEFAULT_HOST + ")")
+    parser.add_argument("--json", action="store_true",
+                        help="print the raw JSON response instead of a summary")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("status", help="show the clock and the meal schedule").set_defaults(
+        func=cmd_status)
+
+    feed = sub.add_parser("feed", help="dispense portions now")
+    feed.add_argument("portions", nargs="?", type=portions_arg, default=1,
+                      help="how many portions (1-{}, default 1)".format(MAX_PORTIONS))
+    feed.add_argument("--timeout", type=bounded_int(100, PORTION_TIMEOUT_MAX_MS), metavar="MS",
+                      help="ms to wait for each portion to reach the sensor"
+                           " (100-{}, default {})".format(PORTION_TIMEOUT_MAX_MS,
+                                                          PORTION_TIMEOUT_MS))
+    feed.set_defaults(func=cmd_feed)
+
+    sub.add_parser("time", help="show the feeder's clock").set_defaults(func=cmd_time)
+    sub.add_parser("sync-time", help="push this computer's clock to the feeder"
+                   ).set_defaults(func=cmd_sync_time)
+
+    meals = sub.add_parser("meals", help="list or edit the meal schedule")
+    meals.set_defaults(func=cmd_meals)
+    meals_sub = meals.add_subparsers(dest="meals_command")
+
+    add = meals_sub.add_parser("add", help="add a meal")
+    add.add_argument("at", type=parse_time_of_day, metavar="HH:MM")
+    add.add_argument("portions", type=portions_arg)
+    add.set_defaults(func=cmd_meal_add)
+
+    change = meals_sub.add_parser("set", help="replace a meal by index")
+    change.add_argument("index", type=int)
+    change.add_argument("at", type=parse_time_of_day, metavar="HH:MM")
+    change.add_argument("portions", type=portions_arg)
+    change.set_defaults(func=cmd_meal_set)
+
+    remove = meals_sub.add_parser("rm", help="delete a meal by index")
+    remove.add_argument("index", type=int)
+    remove.set_defaults(func=cmd_meal_rm)
+
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    try:
+        args.func(args)
+    except FeederError as err:
+        die(str(err))
+
+
+if __name__ == "__main__":
+    main()
