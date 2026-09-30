@@ -45,14 +45,10 @@
 // day.
 #define PORTION_TIMEOUT_MS 10000
 
-// Ceiling on a per-portion timeout asked for by the test endpoint. Pressing the
-// button by hand is much slower than an auger tripping it, so a bench test
-// wants longer than a real meal should ever wait.
+// Ceiling on a per-portion timeout asked for by a /api/dispense request.
+// Pressing the sensor by hand is much slower than an auger tripping it, so a
+// bench test wants longer than a real meal should ever wait.
 #define PORTION_TIMEOUT_MAX_MS 60000
-
-// Ceiling on a bench-test run of the motor. Long enough to watch the auger
-// turn for a while, short enough that a stuck request cannot empty the hopper.
-#define MOTOR_TEST_MAX_MS 10000
 
 // The schedule lives in NVS so it survives a power cut. Bump the version if the
 // stored layout ever changes; a mismatch is treated as "no saved schedule".
@@ -176,9 +172,9 @@ static int localMinuteOfDay(time_t local) {
 }
 
 // serviceSchedule() dispenses from loop(), where pumping the web server keeps
-// the API answerable through a long meal. The test endpoints dispense from
-// inside a request, where re-entering handleClient() would trample the request
-// we have not answered yet.
+// the API answerable through a long meal. /api/dispense dispenses from inside a
+// request, where re-entering handleClient() would trample the request we have
+// not answered yet.
 static bool dispensingFromRequest = false;
 
 static void motorRun() {
@@ -323,9 +319,9 @@ static void clockToJson(JsonObject obj) {
     obj["stale"] = age > CLOCK_STALE_SECONDS;
 }
 
-// Query arguments survive on every content type, so the test endpoints take
-// them as well as a JSON body: `POST /api/motor?ms=500` needs no header and no
-// quoting, which is what you want when the motor is the thing under suspicion.
+// Query arguments survive on every content type, so /api/dispense takes them as
+// well as a JSON body: `POST /api/dispense?portions=2` needs no header and no
+// quoting, which is what you want from a shell or a browser bar.
 static bool intArg(const char* name, int& out) {
     if (!server.hasArg(name)) return false;
 
@@ -334,21 +330,6 @@ static bool intArg(const char* name, int& out) {
     if (value == 0 && raw != "0") return false;
 
     out = value;
-    return true;
-}
-
-static bool boolArg(const char* name, bool& out) {
-    if (!server.hasArg(name)) return false;
-
-    String raw = server.arg(name);
-    if (raw == "1" || raw == "true" || raw == "on") {
-        out = true;
-    } else if (raw == "0" || raw == "false" || raw == "off") {
-        out = false;
-    } else {
-        return false;
-    }
-
     return true;
 }
 
@@ -617,238 +598,6 @@ void handleDispense() {
     sendJson(200, res);
 }
 
-// Reads the two driver inputs back off the pads, which is not the same thing
-// as what we last wrote: a pin that is shorted, or was never claimed as an
-// output, reads back differently from the level we asked for.
-static void motorToJson(JsonObject obj) {
-    obj["in1Pin"] = MOTOR_IN1_PIN;
-    obj["in2Pin"] = MOTOR_IN2_PIN;
-    obj["in1"] = digitalRead(MOTOR_IN1_PIN) == HIGH ? "HIGH" : "LOW";
-    obj["in2"] = digitalRead(MOTOR_IN2_PIN) == HIGH ? "HIGH" : "LOW";
-}
-
-// Drives the motor for `ms` and stops it again, logging once a second so the
-// run can be followed on the serial monitor. The driver inputs are sampled
-// while the motor is still driven: reading them after the stop would only ever
-// tell us that stopping works.
-static void runMotorFor(int ms, JsonObject pins) {
-    Serial.printf("Motor test: starting, will run for %d ms\n", ms);
-
-    motorRun();
-    for (int elapsed = 0; elapsed < ms;) {
-        int slice = (ms - elapsed) < 1000 ? (ms - elapsed) : 1000;
-        delay(slice);
-        elapsed += slice;
-        Serial.printf("Motor test: running, %d/%d ms\n", elapsed, ms);
-    }
-
-    motorToJson(pins);
-    motorStop();
-    Serial.println("Motor test: stopped");
-}
-
-// POST /api/motor -> turn the auger with the sensor out of the picture, so a
-// wiring or direction problem can be told apart from a sensor that never
-// fires. Body is either {"ms": n} for a timed jog, or {"on": true|false} to
-// latch it on and leave it there for as long as it takes to get a meter onto
-// the driver inputs.
-void handleTestMotor() {
-    bool on = false;
-    if (server.hasArg("on")) {
-        if (!boolArg("on", on)) {
-            sendError(400, "'on' must be true or false");
-            return;
-        }
-
-        Serial.printf("Motor test: latched %s\n", on ? "on" : "off");
-        if (on) {
-            motorRun();
-        } else {
-            motorStop();
-        }
-
-        JsonDocument res;
-        res["latched"] = on;
-        motorToJson(res["pins"].to<JsonObject>());
-        sendJson(200, res);
-        return;
-    }
-
-    int queryMs = 0;
-    if (server.hasArg("ms")) {
-        if (!intArg("ms", queryMs) || queryMs < 1 || queryMs > MOTOR_TEST_MAX_MS) {
-            sendError(400, "'ms' must be between 1 and 10000");
-            return;
-        }
-
-        JsonDocument res;
-        res["ms"] = queryMs;
-        runMotorFor(queryMs, res["pins"].to<JsonObject>());
-        sendJson(200, res);
-        return;
-    }
-
-    JsonDocument doc;
-    if (!readBody(doc)) return;
-
-    if (!doc["on"].isNull()) {
-        if (!doc["on"].is<bool>()) {
-            sendError(400, "'on' must be true or false");
-            return;
-        }
-
-        on = doc["on"];
-        Serial.printf("Motor test: latched %s\n", on ? "on" : "off");
-        if (on) {
-            motorRun();
-        } else {
-            motorStop();
-        }
-
-        JsonDocument res;
-        res["latched"] = on;
-        motorToJson(res["pins"].to<JsonObject>());
-        sendJson(200, res);
-        return;
-    }
-
-    if (!doc["ms"].is<int>()) {
-        sendError(400, "Expected integer field 'ms', or boolean field 'on'");
-        return;
-    }
-
-    int ms = doc["ms"];
-    if (ms < 1 || ms > MOTOR_TEST_MAX_MS) {
-        sendError(400, "'ms' must be between 1 and 10000");
-        return;
-    }
-
-    JsonDocument res;
-    res["ms"] = ms;
-    runMotorFor(ms, res["pins"].to<JsonObject>());
-    sendJson(200, res);
-}
-
-// GET /api/motor -> the driver inputs as they sit right now.
-void handleGetMotor() {
-    JsonDocument res;
-    motorToJson(res.to<JsonObject>());
-    sendJson(200, res);
-}
-
-// Every GPIO we can safely read, for finding a wire that is not landing where
-// we think it is: energise it and whichever pin reads HIGH is the one it is
-// really connected to. Left out are the flash pins (6-11), the UART0 pins the
-// serial log needs (1, 3), GPIO0, which dev boards hold high with the boot
-// button, and the two motor outputs. GPIO34-39 have no internal pull-down, so
-// they float and are reported only for completeness.
-static const uint8_t DIAG_PINS[] = {2,  4,  5,  12, 13, 14, 15, 16, 17, 18, 19,
-                                    21, 25, 26, 27, 32, 33, 34, 35, 36, 39};
-
-static bool isDiagPin(int pin) {
-    for (size_t i = 0; i < sizeof(DIAG_PINS) / sizeof(DIAG_PINS[0]); i++) {
-        if ((int)DIAG_PINS[i] == pin) return true;
-    }
-    return false;
-}
-
-// One diagnostic pin can be driven high to act as a test voltage, so a jumper
-// between two header holes can be checked without trusting an external 3V3
-// rail: the board supplies the voltage itself, through a pin we have already
-// proven we can drive.
-static int sourcePin = -1;
-
-// GET /api/pins[?pull=up] -> every candidate input at once, so a misplaced wire
-// can be found without moving it again. With pull-ups, any pin reading LOW is
-// one that something outside the chip is holding at ground: an unconnected pin
-// reads HIGH, so the odd one out is the wired one.
-void handleGetPins() {
-    bool pullUp = false;
-    if (server.hasArg("pull")) {
-        String mode = server.arg("pull");
-        if (mode == "up") {
-            pullUp = true;
-        } else if (mode != "down") {
-            sendError(400, "'pull' must be 'up' or 'down'");
-            return;
-        }
-    }
-
-    JsonDocument res;
-    JsonObject pins = res["pins"].to<JsonObject>();
-
-    for (size_t i = 0; i < sizeof(DIAG_PINS) / sizeof(DIAG_PINS[0]); i++) {
-        uint8_t pin = DIAG_PINS[i];
-        if ((int)pin == sourcePin) continue;  // leave the test source driving
-
-        pinMode(pin, pin >= 34 ? INPUT : (pullUp ? INPUT_PULLUP : INPUT_PULLDOWN));
-        pins[String(pin)] = digitalRead(pin) == HIGH ? "HIGH" : "LOW";
-    }
-
-    // The scan reconfigures the sensor pin along with the rest, so put it back
-    // the way setup() had it rather than leaving the feeder blind until reboot.
-    pinMode(PORTION_SENSOR_PIN, INPUT_PULLUP);
-
-    res["pull"] = pullUp ? "up" : "down";
-
-    if (sourcePin >= 0) res["source"] = sourcePin;
-    res["floating"] = "34-39 have no internal pull-down";
-    sendJson(200, res);
-}
-
-// POST /api/pins/source?pin=N[&on=0] -> drive one diagnostic pin high as a test
-// voltage, or release it. Only one at a time, and only pins that can drive:
-// GPIO34-39 are input-only.
-void handleSetSource() {
-    int pin = 0;
-    if (!intArg("pin", pin)) {
-        sendError(400, "Expected integer query argument 'pin'");
-        return;
-    }
-
-    bool on = true;
-    if (server.hasArg("on") && !boolArg("on", on)) {
-        sendError(400, "'on' must be true or false");
-        return;
-    }
-
-    if (!isDiagPin(pin) || pin >= 34) {
-        sendError(400, "'pin' must be a diagnostic pin that can drive (not 34-39)");
-        return;
-    }
-
-    if (on) {
-        // Release whichever pin was the source before, so only ever one drives.
-        if (sourcePin >= 0 && sourcePin != pin) pinMode(sourcePin, INPUT_PULLDOWN);
-
-        pinMode(pin, OUTPUT);
-        digitalWrite(pin, HIGH);
-        sourcePin = pin;
-    } else {
-        pinMode(pin, INPUT_PULLDOWN);
-        if (sourcePin == pin) sourcePin = -1;
-    }
-
-    Serial.printf("Diagnostic source: GPIO%d %s\n", pin, on ? "driving HIGH" : "released");
-
-    JsonDocument res;
-    res["pin"] = pin;
-    res["driving"] = on;
-    sendJson(200, res);
-}
-
-// GET /api/sensor -> the portion button as the firmware sees it right now.
-// Hold the button down and poll this to check polarity and wiring.
-void handleGetSensor() {
-    int level = digitalRead(PORTION_SENSOR_PIN);
-
-    JsonDocument res;
-    res["pin"] = PORTION_SENSOR_PIN;
-    res["level"] = level == HIGH ? "HIGH" : "LOW";
-    res["pressed"] = level == PORTION_SENSOR_ACTIVE_LEVEL;
-    sendJson(200, res);
-}
-
 void handleNotFound() {
     sendError(404, "No such endpoint");
 }
@@ -886,11 +635,6 @@ void setup() {
     server.on("/api/time", HTTP_GET, handleGetTime);
     server.on("/api/time", HTTP_POST, handleSetTime);
     server.on("/api/dispense", HTTP_POST, handleDispense);
-    server.on("/api/motor", HTTP_POST, handleTestMotor);
-    server.on("/api/motor", HTTP_GET, handleGetMotor);
-    server.on("/api/sensor", HTTP_GET, handleGetSensor);
-    server.on("/api/pins", HTTP_GET, handleGetPins);
-    server.on("/api/pins/source", HTTP_POST, handleSetSource);
     server.onNotFound(handleNotFound);
 
     server.begin();
