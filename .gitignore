@@ -11,6 +11,9 @@ compile_commands.json
 # VS Code
 .vscode/
 
+# Recorded log files (tools/catfeeder record)
+logs/
+
 # OS
 .DS_Store
 

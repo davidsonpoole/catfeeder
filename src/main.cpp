@@ -3,6 +3,8 @@
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
+#include <stdarg.h>
 #include <sys/time.h>
 #include <time.h>
 #include <uri/UriBraces.h>
@@ -20,6 +22,18 @@
 #define MIN_VALID_EPOCH 1577836800LL  // 2020-01-01T00:00:00Z
 #define MAX_TZ_OFFSET_MINUTES 840     // +14:00 .. -14:00 covers every real zone
 #define CLOCK_STALE_SECONDS (14L * SECONDS_PER_DAY)
+
+// The laptop has no fixed address, and it is the laptop that moves, so the
+// feeder broadcasts instead of being told where to look: a sync request goes to
+// whoever is listening on the LAN, and the reply comes back to this socket.
+#define TIME_SYNC_PORT 3956
+#define TIME_SYNC_INTERVAL_MS 30000
+#define TIME_SYNC_PACKET_MAX 192
+
+// Log lines are broadcast too, so a viewer can come and go without the feeder
+// knowing or caring, and a missing listener can never block the scheduler.
+#define LOG_PORT 3957
+#define LOG_LINE_MAX 200
 
 #define MEAL_NEVER_FIRED (-1L)
 
@@ -77,8 +91,50 @@ typedef struct {
 WebServer server(HTTP_PORT);
 Preferences prefs;
 
+WiFiUDP syncUdp;  // bound: sends sync requests and receives the replies
+WiFiUDP logUdp;   // send only: nothing ever answers a log line
+
 Meal meals[MAX_MEALS];
 int numMeals = 0;
+
+// Everything the feeder has to say goes through here: to the serial monitor as
+// before, and to anyone listening on the LAN for the live stream. Logging must
+// never fail a caller, so a line that cannot be broadcast is simply a line that
+// only reached the cable.
+static void logLine(const char* line) {
+    Serial.println(line);
+
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    // Numbering the lines lets a viewer see what UDP dropped, which is the price
+    // of a transport that never blocks the feeder waiting on a listener. The
+    // counter only advances for a line that went out, so a gap means a loss
+    // rather than a line logged before the network was up.
+    static unsigned long sent = 0;
+    char packet[LOG_LINE_MAX + 24];
+    int n = snprintf(packet, sizeof(packet), "%lu %s", sent + 1, line);
+    if (n <= 0) return;
+    if (n >= (int)sizeof(packet)) n = (int)sizeof(packet) - 1;
+
+    if (!logUdp.beginPacket(WiFi.broadcastIP(), LOG_PORT)) return;
+    logUdp.write((const uint8_t*)packet, (size_t)n);
+    if (logUdp.endPacket()) sent++;
+}
+
+// The format attribute is what makes the compiler check these call sites the
+// way it checks printf's.
+static void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+
+static void logf(const char* fmt, ...) {
+    char line[LOG_LINE_MAX];
+
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+
+    logLine(line);
+}
 
 // The schedule is kept in time order, so it reads like a timetable and the
 // indices the API hands out follow the clock. Inserting into place is enough to
@@ -110,7 +166,7 @@ static void removeMeal(int index) {
 // caller can tell the client its change will not survive a reboot.
 static bool saveSchedule() {
     if (!prefs.putUChar(NVS_KEY_VERSION, SCHEDULE_FORMAT_VERSION)) {
-        Serial.println("WARNING: could not write schedule version to NVS");
+        logLine("WARNING: could not write schedule version to NVS");
         return false;
     }
 
@@ -129,7 +185,7 @@ static bool saveSchedule() {
 
     size_t bytes = (size_t)numMeals * sizeof(StoredMeal);
     if (prefs.putBytes(NVS_KEY_MEALS, stored, bytes) != bytes) {
-        Serial.println("WARNING: could not persist meal schedule to NVS");
+        logLine("WARNING: could not persist meal schedule to NVS");
         return false;
     }
 
@@ -142,7 +198,7 @@ static void loadSchedule() {
     uint8_t version = prefs.getUChar(NVS_KEY_VERSION, 0);
     if (version != SCHEDULE_FORMAT_VERSION) {
         if (version != 0) {
-            Serial.printf("Ignoring saved schedule in unknown format %u\n", version);
+            logf("Ignoring saved schedule in unknown format %u", version);
         }
         return;
     }
@@ -151,13 +207,13 @@ static void loadSchedule() {
     if (bytes == 0) return;
 
     if (bytes % sizeof(StoredMeal) != 0 || bytes > sizeof(StoredMeal) * MAX_MEALS) {
-        Serial.printf("Ignoring saved schedule of implausible size %u\n", (unsigned)bytes);
+        logf("Ignoring saved schedule of implausible size %u", (unsigned)bytes);
         return;
     }
 
     StoredMeal stored[MAX_MEALS];
     if (prefs.getBytes(NVS_KEY_MEALS, stored, bytes) != bytes) {
-        Serial.println("WARNING: could not read saved schedule from NVS");
+        logLine("WARNING: could not read saved schedule from NVS");
         return;
     }
 
@@ -165,7 +221,7 @@ static void loadSchedule() {
     for (int i = 0; i < count; i++) {
         if (stored[i].timeOfDay < 0 || stored[i].timeOfDay >= MINUTES_PER_DAY ||
             stored[i].portions < 1 || stored[i].portions > MAX_PORTIONS) {
-            Serial.printf("Dropping out-of-range saved meal %d\n", i);
+            logf("Dropping out-of-range saved meal %d", i);
             continue;
         }
 
@@ -176,7 +232,7 @@ static void loadSchedule() {
         insertMeal(meal);  // a schedule saved before meals were ordered
     }
 
-    Serial.printf("Restored %d meal(s) from flash\n", numMeals);
+    logf("Restored %d meal(s) from flash", numMeals);
 }
 
 // Set by POST /api/time. Until then the scheduler stays parked.
@@ -255,13 +311,12 @@ static int dispensePortions(int portions, unsigned long timeoutMs) {
     motorRun();
     while (served < portions) {
         if (!dispenseOnePortion(timeoutMs)) {
-            Serial.printf("Dispense: no portion within %lu ms (jam or empty hopper?)\n",
-                          timeoutMs);
+            logf("Dispense: no portion within %lu ms (jam or empty hopper?)", timeoutMs);
             break;
         }
 
         served++;
-        Serial.printf("Dispense: portion %d of %d\n", served, portions);
+        logf("Dispense: portion %d of %d", served, portions);
     }
     motorStop();
 
@@ -269,12 +324,12 @@ static int dispensePortions(int portions, unsigned long timeoutMs) {
 }
 
 static void MealEvent(const Meal& meal) {
-    Serial.printf("MealEvent: serving %d portion(s) (scheduled for %02d:%02d)\n", meal.portions,
-                  meal.timeOfDay / 60, meal.timeOfDay % 60);
+    logf("MealEvent: serving %d portion(s) (scheduled for %02d:%02d)", meal.portions,
+         meal.timeOfDay / 60, meal.timeOfDay % 60);
 
     int served = dispensePortions(meal.portions, PORTION_TIMEOUT_MS);
 
-    Serial.printf("MealEvent: served %d of %d portion(s)\n", served, meal.portions);
+    logf("MealEvent: served %d of %d portion(s)", served, meal.portions);
 }
 
 // Marks meals whose time has already passed today as done, so that a device
@@ -313,7 +368,24 @@ static void serviceSchedule() {
     }
 }
 
+static const char* methodName(HTTPMethod method) {
+    switch (method) {
+        case HTTP_GET: return "GET";
+        case HTTP_POST: return "POST";
+        case HTTP_PUT: return "PUT";
+        case HTTP_DELETE: return "DELETE";
+        default: return "?";
+    }
+}
+
+// Every answer the feeder gives leaves through here, so this is also where each
+// request is logged: one line with who asked, what they asked for, and what
+// they got. Nothing has to remember to log itself, and a request refused before
+// a handler could do anything is on the log like any other.
 static void sendJson(int code, const JsonDocument& doc) {
+    logf("%s %s %s -> %d", server.client().remoteIP().toString().c_str(),
+         methodName(server.method()), server.uri().c_str(), code);
+
     String body;
     serializeJson(doc, body);
     server.send(code, "application/json", body);
@@ -375,7 +447,7 @@ static bool readBody(JsonDocument& doc) {
 
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
     if (err) {
-        Serial.printf("JSON parse error: %s\n", err.c_str());
+        logf("JSON parse error: %s", err.c_str());
         sendError(400, "Body is not valid JSON");
         return false;
     }
@@ -453,7 +525,7 @@ void handleAddMeal() {
     int index = insertMeal(meal);
     armSchedule();  // don't serve a meal whose time passed before it existed
     bool persisted = saveSchedule();
-    Serial.printf("Added meal %d: %d portions at %d\n", index, meal.portions, meal.timeOfDay);
+    logf("Added meal %d: %d portions at %d", index, meal.portions, meal.timeOfDay);
 
     JsonDocument res;
     res["index"] = index;
@@ -486,8 +558,8 @@ void handleChangeMeal() {
 
     armSchedule();
     bool persisted = saveSchedule();
-    Serial.printf("Changed meal %d: %d portions at %d (now meal %d)\n", index, meal.portions,
-                  meal.timeOfDay, newIndex);
+    logf("Changed meal %d: %d portions at %d (now meal %d)", index, meal.portions,
+         meal.timeOfDay, newIndex);
 
     JsonDocument res;
     res["index"] = newIndex;
@@ -505,7 +577,7 @@ void handleDeleteMeal() {
     removeMeal(index);
 
     bool persisted = saveSchedule();
-    Serial.printf("Deleted meal %d\n", index);
+    logf("Deleted meal %d", index);
 
     JsonDocument res;
     res["persisted"] = persisted;
@@ -523,34 +595,33 @@ void handleGetTime() {
 // POST /api/time -> set the clock from the laptop. The device has no RTC
 // battery and no route to the internet, so this is the only way it learns the
 // time; tools/sync-time.sh runs this weekly.
-void handleSetTime() {
-    JsonDocument doc;
-    if (!readBody(doc)) return;
-
-    if (!doc["epoch"].is<long long>()) {
-        sendError(400, "Expected integer field 'epoch' (seconds since 1970, UTC)");
-        return;
+// Reads a time out of a pushed request body or a sync reply. Returns nullptr
+// when it is usable, or why it was refused, so the HTTP path can answer with
+// the reason and the sync path can log it.
+static const char* timeFromJson(JsonObjectConst obj, long long& epoch, long& offset) {
+    if (!obj["epoch"].is<long long>()) {
+        return "Expected integer field 'epoch' (seconds since 1970, UTC)";
     }
 
-    long long epoch = doc["epoch"];
-    if (epoch < MIN_VALID_EPOCH) {
-        sendError(400, "'epoch' is implausibly far in the past");
-        return;
-    }
+    epoch = obj["epoch"];
+    if (epoch < MIN_VALID_EPOCH) return "'epoch' is implausibly far in the past";
 
-    long offset = 0;
-    if (!doc["tzOffsetMinutes"].isNull()) {
-        if (!doc["tzOffsetMinutes"].is<int>()) {
-            sendError(400, "'tzOffsetMinutes' must be an integer");
-            return;
-        }
-        offset = (long)doc["tzOffsetMinutes"].as<int>();
+    offset = 0;
+    if (!obj["tzOffsetMinutes"].isNull()) {
+        if (!obj["tzOffsetMinutes"].is<int>()) return "'tzOffsetMinutes' must be an integer";
+
+        offset = (long)obj["tzOffsetMinutes"].as<int>();
         if (offset < -MAX_TZ_OFFSET_MINUTES || offset > MAX_TZ_OFFSET_MINUTES) {
-            sendError(400, "'tzOffsetMinutes' must be between -840 and 840");
-            return;
+            return "'tzOffsetMinutes' must be between -840 and 840";
         }
     }
 
+    return nullptr;
+}
+
+// The one place the clock is set, whichever way the time arrived. `source` only
+// shapes the log line.
+static void applyTime(long long epoch, long offset, const char* source) {
     struct timeval tv;
     tv.tv_sec = (time_t)epoch;
     tv.tv_usec = 0;
@@ -562,9 +633,93 @@ void handleSetTime() {
     armSchedule();
 
     time_t local = localNow();
-    Serial.printf("Clock synced: local time %02d:%02d (UTC%+ld:%02ld)\n",
-                  localMinuteOfDay(local) / 60, localMinuteOfDay(local) % 60, offset / 60,
-                  labs(offset) % 60);
+    logf("Clock synced from %s: local time %02d:%02d (UTC%+ld:%02ld)", source,
+         localMinuteOfDay(local) / 60, localMinuteOfDay(local) % 60, offset / 60,
+         labs(offset) % 60);
+}
+
+// Asks the LAN for the time. Broadcast, because the feeder does not know the
+// laptop's address and the laptop's address changes; whoever is running the
+// responder answers, and anything else on the network ignores it.
+static void requestTimeSync() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    static const char request[] = "{\"catfeeder\":\"sync-request\"}";
+    if (!syncUdp.beginPacket(WiFi.broadcastIP(), TIME_SYNC_PORT)) return;
+
+    syncUdp.write((const uint8_t*)request, sizeof(request) - 1);
+    syncUdp.endPacket();
+}
+
+// Applies a sync reply, and asks again every TIME_SYNC_INTERVAL_MS for as long
+// as the clock is unset. Called from loop().
+static void serviceTimeSync() {
+    static unsigned long lastRequest = 0;
+    static bool asked = false;
+
+    // Drain whatever arrived, even once synced: an unread socket only fills up.
+    for (int size = syncUdp.parsePacket(); size > 0; size = syncUdp.parsePacket()) {
+        char packet[TIME_SYNC_PACKET_MAX];
+        int n = syncUdp.read((uint8_t*)packet, sizeof(packet) - 1);
+        if (n <= 0) continue;
+        packet[n] = '\0';
+
+        IPAddress from = syncUdp.remoteIP();
+
+        // Once the clock is set, nothing on the LAN gets to move it again; a push
+        // to /api/time is the deliberate way to correct it. Say so rather than
+        // dropping it in silence, or an answer that arrives too late looks
+        // exactly like logging that does not work.
+        if (clockSynced) {
+            logf("Ignoring sync reply from %s: the clock is already set", from.toString().c_str());
+            continue;
+        }
+
+        JsonDocument doc;
+        if (deserializeJson(doc, packet)) {
+            logf("Ignoring unreadable sync reply from %s", from.toString().c_str());
+            continue;
+        }
+
+        // Our own broadcast, on a network that echoes it back to us.
+        if (doc["catfeeder"] == "sync-request") continue;
+
+        long long epoch = 0;
+        long offset = 0;
+        const char* why = timeFromJson(doc.as<JsonObjectConst>(), epoch, offset);
+        if (why) {
+            logf("Ignoring sync reply from %s: %s", from.toString().c_str(), why);
+            continue;
+        }
+
+        applyTime(epoch, offset, from.toString().c_str());
+    }
+
+    if (clockSynced) return;
+
+    // Unsigned arithmetic, so millis() rollover is fine.
+    unsigned long now = millis();
+    if (asked && now - lastRequest < TIME_SYNC_INTERVAL_MS) return;
+
+    lastRequest = now;
+    asked = true;
+    logf("Clock not set: asking the network for the time on UDP port %d", TIME_SYNC_PORT);
+    requestTimeSync();
+}
+
+void handleSetTime() {
+    JsonDocument doc;
+    if (!readBody(doc)) return;
+
+    long long epoch = 0;
+    long offset = 0;
+    const char* why = timeFromJson(doc.as<JsonObjectConst>(), epoch, offset);
+    if (why) {
+        sendError(400, why);
+        return;
+    }
+
+    applyTime(epoch, offset, "a pushed request");
 
     JsonDocument res;
     clockToJson(res.to<JsonObject>());
@@ -611,8 +766,7 @@ void handleDispense() {
         }
     }
 
-    Serial.printf("Manual dispense of %d portion(s) requested, %d ms per portion\n", portions,
-                  timeoutMs);
+    logf("Manual dispense of %d portion(s) requested, %d ms per portion", portions, timeoutMs);
 
     dispensingFromRequest = true;
     int served = dispensePortions(portions, (unsigned long)timeoutMs);
@@ -643,7 +797,7 @@ void setup() {
     if (prefs.begin(NVS_NAMESPACE, false)) {
         loadSchedule();
     } else {
-        Serial.println("WARNING: could not open NVS; schedule will not persist");
+        logLine("WARNING: could not open NVS; schedule will not persist");
     }
 
     WiFi.setSleep(false);
@@ -653,7 +807,7 @@ void setup() {
         delay(500);
         Serial.print(".");
     }
-    Serial.println("Connected, IP: " + WiFi.localIP().toString());
+    logf("Connected, IP: %s", WiFi.localIP().toString().c_str());
 
     server.on("/api/settings", HTTP_GET, handleGetSettings);
     server.on("/api/meals", HTTP_GET, handleGetSettings);
@@ -666,22 +820,28 @@ void setup() {
     server.onNotFound(handleNotFound);
 
     server.begin();
-    Serial.printf("Listening for HTTP on port %d\n", HTTP_PORT);
-    Serial.println("Clock not set: waiting for POST /api/time before feeding");
+    logf("Listening for HTTP on port %d", HTTP_PORT);
+
+    // Bound before the first request so the reply has somewhere to land.
+    syncUdp.begin(TIME_SYNC_PORT);
+    logf("Streaming logs to UDP port %d", LOG_PORT);
+    logLine("Clock not set: no meal will be served until it is");
+    serviceTimeSync();
 }
 
 void loop() {
 
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("WiFi connection lost! Reconnecting...");
+        logLine("WiFi connection lost! Reconnecting...");
         while (WiFi.status() != WL_CONNECTED) {
             delay(500);
             Serial.print(".");
         }
-        Serial.println("Connected, IP: " + WiFi.localIP().toString());
+        logf("Connected, IP: %s", WiFi.localIP().toString().c_str());
     }
 
     server.handleClient();
+    serviceTimeSync();
 
     static unsigned long lastCheck = 0;
     unsigned long now = millis();

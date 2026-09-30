@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Keeps the feeder's log on disk.
+
+     The feeder broadcasts its log, and nothing stores it: close the viewer and
+     the log is gone. This agent runs `catfeeder record`, which appends the
+     stream to logs/MM-DD-YY.log, a file per day.
+
+     Install:
+       cp tools/catfeeder-logger.plist ~/Library/LaunchAgents/local.catfeeder.logger.plist
+       # edit the path below to match this checkout, then:
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.catfeeder.logger.plist
+
+     It shares the log port, so `catfeeder logs` still works while this runs and
+     both see every line. macOS may ask once whether python3 can accept
+     incoming connections; it needs to, to hear the broadcast. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.catfeeder.logger</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/davidson/git/self/catfeeder/tools/catfeeder</string>
+        <string>record</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/catfeeder-logger.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/catfeeder-logger.log</string>
+</dict>
+</plist>

@@ -10,6 +10,9 @@ The host comes from --host, else $CATFEEDER_HOST, else the default below.
     catfeeder feed 2             dispense two portions now
     catfeeder sync-time          push this computer's clock to the feeder
     catfeeder meals add 07:30 2  feed two portions at 07:30 every day
+    catfeeder serve-time         answer the feeder's requests for the time
+    catfeeder logs               follow the feeder's log stream
+    catfeeder record             write the log stream to a file per day
 """
 
 import argparse
@@ -26,6 +29,15 @@ DEFAULT_HOST = "192.168.1.244"
 
 # Mirrors of the firmware's limits, so bad input is rejected here with a clearer
 # message than the 400 the feeder would send back.
+# Where `record` keeps the daily log files, and what it calls them.
+LOG_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "logs")
+LOG_FILE_FORMAT = "%m-%d-%y.log"
+
+# Both must match the firmware (see src/main.cpp).
+TIME_SYNC_PORT = 3956
+LOG_PORT = 3957
+
 MAX_PORTIONS = 10
 MINUTES_PER_DAY = 1440
 PORTION_TIMEOUT_MS = 10000
@@ -219,14 +231,17 @@ def cmd_time(args):
     show(args, data, clock_lines(data))
 
 
-def cmd_sync_time(args):
+def local_time_message():
+    """The time as the feeder wants it: UTC seconds plus this zone's offset."""
     now = time.time()
     offset = -round(
         (time.altzone if time.localtime(now).tm_isdst and time.daylight
          else time.timezone) / 60)
+    return {"epoch": int(now), "tzOffsetMinutes": offset}
 
-    data = request(args, "POST", "/api/time",
-                   {"epoch": int(now), "tzOffsetMinutes": offset})
+
+def cmd_sync_time(args):
+    data = request(args, "POST", "/api/time", local_time_message())
     show(args, data, clock_lines(data))
 
 
@@ -263,6 +278,156 @@ def unsaved(data):
     return "" if data.get("persisted", True) else "  [NOT SAVED to flash]"
 
 
+def stamp(message):
+    """Prints a timestamped line, flushed so a pipe sees it straight away."""
+    print("{}  {}".format(time.strftime("%H:%M:%S"), message), flush=True)
+
+
+def bind_udp(port, share=False):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    # Log lines are broadcast, so several viewers can each have a copy. The
+    # responder deliberately does not share: a second one is a mistake, and
+    # better reported than silently answering alongside the first.
+    if share and hasattr(socket, "SO_REUSEPORT"):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+
+    try:
+        sock.bind(("", port))     # every interface, to catch the broadcast
+    except OSError as err:
+        raise FeederError("cannot listen on UDP port {}: {}".format(port, err))
+
+    return sock
+
+
+def cmd_serve_time(args):
+    """Answers the feeder's broadcast asking what time it is."""
+    if args.json:
+        raise FeederError("--json does not apply to serve-time")
+
+    sock = bind_udp(TIME_SYNC_PORT)
+    stamp("answering sync requests on UDP port {}".format(TIME_SYNC_PORT))
+
+    try:
+        while True:
+            data, addr = sock.recvfrom(512)
+            try:
+                asked = json.loads(data.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if asked.get("catfeeder") != "sync-request":
+                continue
+
+            reply = local_time_message()
+            sock.sendto(json.dumps(reply).encode(), addr)
+
+            local = time.localtime(reply["epoch"])
+            stamp("{} asked for the time, sent {} UTC{}".format(
+                addr[0], time.strftime("%H:%M:%S", local),
+                fmt_offset(reply["tzOffsetMinutes"])))
+    except KeyboardInterrupt:
+        pass
+
+
+def follow_log(sock):
+    """Yields the feeder's log lines, and a note wherever the stream skipped."""
+    expected = None
+    last = None
+
+    while True:
+        data, _ = sock.recvfrom(2048)
+        text = data.decode("utf-8", "replace").rstrip("\r\n")
+
+        # Each line is numbered, so a gap in the numbers is a line UDP lost.
+        number, _, line = text.partition(" ")
+        try:
+            seq = int(number)
+        except ValueError:
+            yield text          # not one of ours, or the number went missing
+            continue
+
+        if expected is not None and seq < expected:
+            # A broadcast can arrive twice, over two interfaces onto the same
+            # socket. The same number carrying the same line is that, and it is
+            # already recorded, so it is dropped rather than counted as news.
+            if (seq, line) == last:
+                continue
+
+            # Numbering only goes backwards for real when the feeder restarts,
+            # which starts it over at 1. Anything else is a stray, and saying
+            # nothing beats claiming a reboot that did not happen.
+            if seq != 1:
+                continue
+
+            yield "-- the feeder restarted --"
+        elif expected is not None and seq > expected:
+            missing = seq - expected
+            yield "-- {} log line{} lost --".format(
+                missing, "" if missing == 1 else "s")
+
+        expected = seq + 1
+        last = (seq, line)
+        yield line
+
+
+def cmd_logs(args):
+    """Prints the feeder's log lines as they are broadcast."""
+    if args.json:
+        raise FeederError("--json does not apply to logs")
+
+    sock = bind_udp(LOG_PORT, share=True)
+    stamp("following the log on UDP port {}".format(LOG_PORT))
+
+    try:
+        for line in follow_log(sock):
+            stamp(line)
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_record(args):
+    """Appends the log stream to one file per day, rotating at midnight."""
+    if args.json:
+        raise FeederError("--json does not apply to record")
+
+    directory = args.dir or LOG_DIR
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as err:
+        raise FeederError("cannot use {}: {}".format(directory, err))
+
+    # Shares the port, so an interactive `catfeeder logs` still sees every line.
+    sock = bind_udp(LOG_PORT, share=True)
+    stamp("recording the log to {}".format(directory))
+
+    handle = None
+    open_name = None
+    try:
+        for line in follow_log(sock):
+            now = time.localtime()
+
+            # The date is in the filename, so the line only carries the time.
+            name = time.strftime(LOG_FILE_FORMAT, now)
+            if name != open_name:
+                if handle is not None:
+                    handle.close()
+                path = os.path.join(directory, name)
+                try:
+                    handle = open(path, "a", buffering=1)  # a line at a time, so
+                except OSError as err:                     # tail -f keeps up
+                    raise FeederError("cannot write {}: {}".format(path, err))
+                open_name = name
+                stamp("writing to " + path)
+
+            handle.write("{}  {}\n".format(time.strftime("%H:%M:%S", now), line))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if handle is not None:
+            handle.close()
+
+
 # ---------------------------------------------------------------- arguments
 
 
@@ -291,6 +456,18 @@ def build_parser():
     sub.add_parser("time", help="show the feeder's clock").set_defaults(func=cmd_time)
     sub.add_parser("sync-time", help="push this computer's clock to the feeder"
                    ).set_defaults(func=cmd_sync_time)
+
+    sub.add_parser("serve-time",
+                   help="answer the feeder's requests for the time (runs until stopped)"
+                   ).set_defaults(func=cmd_serve_time)
+    sub.add_parser("logs", help="follow the feeder's log stream (runs until stopped)"
+                   ).set_defaults(func=cmd_logs)
+
+    record = sub.add_parser("record",
+                            help="write the log stream to one file per day (runs until stopped)")
+    record.add_argument("--dir", metavar="DIR",
+                        help="where to keep the log files (default: {})".format(LOG_DIR))
+    record.set_defaults(func=cmd_record)
 
     meals = sub.add_parser("meals", help="list or edit the meal schedule")
     meals.set_defaults(func=cmd_meals)
