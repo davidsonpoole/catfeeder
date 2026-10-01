@@ -8,9 +8,8 @@ The host comes from --host, else $CATFEEDER_HOST, else the default below.
 
     catfeeder status             what is on the schedule, and is the clock set
     catfeeder feed 2             dispense two portions now
-    catfeeder sync-time          push this computer's clock to the feeder
     catfeeder meals add 07:30 2  feed two portions at 07:30 every day
-    catfeeder serve-time         answer the feeder's requests for the time
+    catfeeder time               what the feeder thinks the time is
     catfeeder logs               follow the feeder's log stream
     catfeeder record             write the log stream to a file per day
 """
@@ -34,8 +33,7 @@ LOG_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "logs")
 LOG_FILE_FORMAT = "%m-%d-%y.log"
 
-# Both must match the firmware (see src/main.cpp).
-TIME_SYNC_PORT = 3956
+# Must match the firmware (see src/main.cpp).
 LOG_PORT = 3957
 
 MAX_PORTIONS = 10
@@ -175,8 +173,8 @@ def fmt_portions(n):
 
 def clock_lines(clock):
     if not clock.get("synced"):
-        return ["clock:  NOT SYNCED - the feeder will not feed until it is"
-                " (run: catfeeder sync-time)"]
+        return ["clock:  NOT SYNCED - the feeder will not feed until NTP answers"
+                " (needs a route to the internet)"]
 
     line = "clock:  local {}, UTC{}, synced {} ago".format(
         fmt_minutes(clock["localMinuteOfDay"]),
@@ -228,20 +226,6 @@ def cmd_feed(args):
 
 def cmd_time(args):
     data = request(args, "GET", "/api/time")
-    show(args, data, clock_lines(data))
-
-
-def local_time_message():
-    """The time as the feeder wants it: UTC seconds plus this zone's offset."""
-    now = time.time()
-    offset = -round(
-        (time.altzone if time.localtime(now).tm_isdst and time.daylight
-         else time.timezone) / 60)
-    return {"epoch": int(now), "tzOffsetMinutes": offset}
-
-
-def cmd_sync_time(args):
-    data = request(args, "POST", "/api/time", local_time_message())
     show(args, data, clock_lines(data))
 
 
@@ -299,35 +283,6 @@ def bind_udp(port, share=False):
         raise FeederError("cannot listen on UDP port {}: {}".format(port, err))
 
     return sock
-
-
-def cmd_serve_time(args):
-    """Answers the feeder's broadcast asking what time it is."""
-    if args.json:
-        raise FeederError("--json does not apply to serve-time")
-
-    sock = bind_udp(TIME_SYNC_PORT)
-    stamp("answering sync requests on UDP port {}".format(TIME_SYNC_PORT))
-
-    try:
-        while True:
-            data, addr = sock.recvfrom(512)
-            try:
-                asked = json.loads(data.decode("utf-8", "replace"))
-            except ValueError:
-                continue
-            if asked.get("catfeeder") != "sync-request":
-                continue
-
-            reply = local_time_message()
-            sock.sendto(json.dumps(reply).encode(), addr)
-
-            local = time.localtime(reply["epoch"])
-            stamp("{} asked for the time, sent {} UTC{}".format(
-                addr[0], time.strftime("%H:%M:%S", local),
-                fmt_offset(reply["tzOffsetMinutes"])))
-    except KeyboardInterrupt:
-        pass
 
 
 def follow_log(sock):
@@ -454,12 +409,6 @@ def build_parser():
     feed.set_defaults(func=cmd_feed)
 
     sub.add_parser("time", help="show the feeder's clock").set_defaults(func=cmd_time)
-    sub.add_parser("sync-time", help="push this computer's clock to the feeder"
-                   ).set_defaults(func=cmd_sync_time)
-
-    sub.add_parser("serve-time",
-                   help="answer the feeder's requests for the time (runs until stopped)"
-                   ).set_defaults(func=cmd_serve_time)
     sub.add_parser("logs", help="follow the feeder's log stream (runs until stopped)"
                    ).set_defaults(func=cmd_logs)
 

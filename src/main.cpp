@@ -4,6 +4,7 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <esp_sntp.h>
 #include <stdarg.h>
 #include <sys/time.h>
 #include <time.h>
@@ -17,18 +18,36 @@
 #define MINUTES_PER_DAY 1440
 #define SECONDS_PER_DAY 86400L
 
-// The clock has no battery, so it only means anything once the laptop has sent
-// us the time. Anything before 2020 is a device that has not been told yet.
+// The clock has no battery, so it means nothing until something has told us the
+// time. Anything before 2020 is a device that has not been told yet.
 #define MIN_VALID_EPOCH 1577836800LL  // 2020-01-01T00:00:00Z
-#define MAX_TZ_OFFSET_MINUTES 840     // +14:00 .. -14:00 covers every real zone
 #define CLOCK_STALE_SECONDS (14L * SECONDS_PER_DAY)
 
-// The laptop has no fixed address, and it is the laptop that moves, so the
-// feeder broadcasts instead of being told where to look: a sync request goes to
-// whoever is listening on the LAN, and the reply comes back to this socket.
-#define TIME_SYNC_PORT 3956
-#define TIME_SYNC_INTERVAL_MS 30000
-#define TIME_SYNC_PACKET_MAX 192
+// WiFi comes and goes; the scheduler must not. Nothing on the reconnect path
+// blocks, so a meal whose time arrives during an outage is still served on
+// time: the clock is local and the motor needs no network. The ESP32
+// reconnects on its own, but only to an AP that still looks the way it did, so
+// we also re-issue begin() now and then for a router that came back different.
+// The interval is generous because a begin() while an association is already in
+// flight starts that association over.
+#define WIFI_RETRY_INTERVAL_MS 30000
+
+// The feeder gets the time from the internet and works out local time itself,
+// so nothing on the LAN has to be awake for the cat to be fed. NTP only ever
+// answers in UTC; the zone rule below is what turns that into wall-clock time.
+//
+// EST5EDT,M3.2.0,M11.1.0 is America/New_York: 5 hours west of UTC (POSIX
+// inverts the sign), daylight time from the 2nd Sunday in March to the 1st in
+// November. The switchovers are rules rather than dates, so libc works them out
+// arithmetically for any year and needs no calendar data and no network. If the
+// law ever moves those dates, this line is what has to be reflashed.
+#define POSIX_TZ "EST5EDT,M3.2.0,M11.1.0"
+#define NTP_SERVER_1 "pool.ntp.org"
+#define NTP_SERVER_2 "time.nist.gov"
+
+// SNTP polls in the background on its own schedule; this is only how often
+// loop() looks at what it has done.
+#define NTP_CHECK_INTERVAL_MS 1000
 
 // Log lines are broadcast too, so a viewer can come and go without the feeder
 // knowing or caring, and a missing listener can never block the scheduler.
@@ -91,8 +110,7 @@ typedef struct {
 WebServer server(HTTP_PORT);
 Preferences prefs;
 
-WiFiUDP syncUdp;  // bound: sends sync requests and receives the replies
-WiFiUDP logUdp;   // send only: nothing ever answers a log line
+WiFiUDP logUdp;  // send only: nothing ever answers a log line
 
 Meal meals[MAX_MEALS];
 int numMeals = 0;
@@ -235,13 +253,50 @@ static void loadSchedule() {
     logf("Restored %d meal(s) from flash", numMeals);
 }
 
-// Set by POST /api/time. Until then the scheduler stays parked.
+// Set once NTP (or a pushed POST /api/time) has handed us a believable epoch.
+// Until then the scheduler stays parked.
 bool clockSynced = false;
+
+// Minutes east of UTC for the current instant, daylight saving included.
+// Derived from POSIX_TZ by refreshTzOffset(); never taken from the network.
 long tzOffsetMinutes = 0;
 time_t lastSyncEpoch = 0;
 
-// Local wall-clock seconds: UTC as the laptop gave it, shifted into the
-// laptop's timezone. We never use the libc timezone, so this stays honest.
+// Asks libc what POSIX_TZ means right now and caches it in the sign and units
+// the rest of the code already works in, so the arithmetic below stays plain.
+// Called every tick, so a switchover is picked up within a second of happening
+// -- including during a network outage, which is the point of a rule over a
+// lookup.
+static void refreshTzOffset() {
+    time_t now = time(nullptr);
+
+    // This newlib has no tm_gmtoff and no timegm(), so the offset comes from
+    // the only thing that is always there: the same instant rendered both ways.
+    // localtime_r() applies the zone rule to `now` itself, so unlike handing
+    // mktime() a tm_isdst guess, there is nothing ambiguous about it even an
+    // hour either side of a switchover.
+    struct tm local;
+    struct tm utc;
+    if (!localtime_r(&now, &local) || !gmtime_r(&now, &utc)) return;
+
+    // Every real zone is a whole number of minutes off UTC, so the seconds
+    // always agree and the clock faces are enough to compare.
+    long minutes = (local.tm_hour * 60L + local.tm_min) - (utc.tm_hour * 60L + utc.tm_min);
+
+    // The two renderings can land on different dates. A one-day gap is the
+    // ordinary case; a ~365-day gap is the same thing seen across New Year.
+    int days = local.tm_yday - utc.tm_yday;
+    if (days == 1 || days < -1) {
+        minutes += MINUTES_PER_DAY;
+    } else if (days == -1 || days > 1) {
+        minutes -= MINUTES_PER_DAY;
+    }
+
+    tzOffsetMinutes = minutes;
+}
+
+// Local wall-clock seconds: UTC as NTP gave it, shifted by the offset the zone
+// rule says applies to this instant.
 static time_t localNow() {
     return time(nullptr) + tzOffsetMinutes * 60;
 }
@@ -405,6 +460,7 @@ static void mealToJson(const Meal& meal, JsonObject obj) {
 static void clockToJson(JsonObject obj) {
     obj["synced"] = clockSynced;
     obj["tzOffsetMinutes"] = tzOffsetMinutes;
+    obj["tz"] = POSIX_TZ;
 
     if (!clockSynced) return;
 
@@ -592,13 +648,11 @@ void handleGetTime() {
     sendJson(200, doc);
 }
 
-// POST /api/time -> set the clock from the laptop. The device has no RTC
-// battery and no route to the internet, so this is the only way it learns the
-// time; tools/sync-time.sh runs this weekly.
-// Reads a time out of a pushed request body or a sync reply. Returns nullptr
-// when it is usable, or why it was refused, so the HTTP path can answer with
-// the reason and the sync path can log it.
-static const char* timeFromJson(JsonObjectConst obj, long long& epoch, long& offset) {
+// Reads a UTC epoch out of a pushed request body. Returns nullptr when it is
+// usable, or why it was refused, so the handler can answer with the reason. No
+// timezone is read: the feeder's zone is POSIX_TZ, and a caller who disagrees
+// with it would only be telling the feeder where it is not.
+static const char* timeFromJson(JsonObjectConst obj, long long& epoch) {
     if (!obj["epoch"].is<long long>()) {
         return "Expected integer field 'epoch' (seconds since 1970, UTC)";
     }
@@ -606,105 +660,65 @@ static const char* timeFromJson(JsonObjectConst obj, long long& epoch, long& off
     epoch = obj["epoch"];
     if (epoch < MIN_VALID_EPOCH) return "'epoch' is implausibly far in the past";
 
-    offset = 0;
-    if (!obj["tzOffsetMinutes"].isNull()) {
-        if (!obj["tzOffsetMinutes"].is<int>()) return "'tzOffsetMinutes' must be an integer";
-
-        offset = (long)obj["tzOffsetMinutes"].as<int>();
-        if (offset < -MAX_TZ_OFFSET_MINUTES || offset > MAX_TZ_OFFSET_MINUTES) {
-            return "'tzOffsetMinutes' must be between -840 and 840";
-        }
-    }
-
     return nullptr;
 }
 
 // The one place the clock is set, whichever way the time arrived. `source` only
 // shapes the log line.
-static void applyTime(long long epoch, long offset, const char* source) {
+static void applyTime(long long epoch, const char* source) {
     struct timeval tv;
     tv.tv_sec = (time_t)epoch;
     tv.tv_usec = 0;
     settimeofday(&tv, nullptr);
 
-    tzOffsetMinutes = offset;
+    refreshTzOffset();  // the zone rule, now that there is an instant to apply it to
     lastSyncEpoch = (time_t)epoch;
     clockSynced = true;
     armSchedule();
 
     time_t local = localNow();
     logf("Clock synced from %s: local time %02d:%02d (UTC%+ld:%02ld)", source,
-         localMinuteOfDay(local) / 60, localMinuteOfDay(local) % 60, offset / 60,
-         labs(offset) % 60);
+         localMinuteOfDay(local) / 60, localMinuteOfDay(local) % 60,
+         tzOffsetMinutes / 60, labs(tzOffsetMinutes) % 60);
 }
 
-// Asks the LAN for the time. Broadcast, because the feeder does not know the
-// laptop's address and the laptop's address changes; whoever is running the
-// responder answers, and anything else on the network ignores it.
-static void requestTimeSync() {
+// Starts SNTP as soon as there is a network, and notices what it has done.
+// SNTP does the asking in a background task on its own schedule, so nothing
+// here waits on a reply: this only ever looks at the clock and moves on.
+static void serviceNtp() {
+    static bool started = false;
+    static unsigned long lastCheck = 0;
+
+    // DNS has nowhere to go until we are associated, and SNTP needs a name.
     if (WiFi.status() != WL_CONNECTED) return;
 
-    static const char request[] = "{\"catfeeder\":\"sync-request\"}";
-    if (!syncUdp.beginPacket(WiFi.broadcastIP(), TIME_SYNC_PORT)) return;
-
-    syncUdp.write((const uint8_t*)request, sizeof(request) - 1);
-    syncUdp.endPacket();
-}
-
-// Applies a sync reply, and asks again every TIME_SYNC_INTERVAL_MS for as long
-// as the clock is unset. Called from loop().
-static void serviceTimeSync() {
-    static unsigned long lastRequest = 0;
-    static bool asked = false;
-
-    // Drain whatever arrived, even once synced: an unread socket only fills up.
-    for (int size = syncUdp.parsePacket(); size > 0; size = syncUdp.parsePacket()) {
-        char packet[TIME_SYNC_PACKET_MAX];
-        int n = syncUdp.read((uint8_t*)packet, sizeof(packet) - 1);
-        if (n <= 0) continue;
-        packet[n] = '\0';
-
-        IPAddress from = syncUdp.remoteIP();
-
-        // Once the clock is set, nothing on the LAN gets to move it again; a push
-        // to /api/time is the deliberate way to correct it. Say so rather than
-        // dropping it in silence, or an answer that arrives too late looks
-        // exactly like logging that does not work.
-        if (clockSynced) {
-            logf("Ignoring sync reply from %s: the clock is already set", from.toString().c_str());
-            continue;
-        }
-
-        JsonDocument doc;
-        if (deserializeJson(doc, packet)) {
-            logf("Ignoring unreadable sync reply from %s", from.toString().c_str());
-            continue;
-        }
-
-        // Our own broadcast, on a network that echoes it back to us.
-        if (doc["catfeeder"] == "sync-request") continue;
-
-        long long epoch = 0;
-        long offset = 0;
-        const char* why = timeFromJson(doc.as<JsonObjectConst>(), epoch, offset);
-        if (why) {
-            logf("Ignoring sync reply from %s: %s", from.toString().c_str(), why);
-            continue;
-        }
-
-        applyTime(epoch, offset, from.toString().c_str());
+    if (!started) {
+        started = true;
+        configTzTime(POSIX_TZ, NTP_SERVER_1, NTP_SERVER_2);
+        logf("Asking %s for the time, zone %s", NTP_SERVER_1, POSIX_TZ);
     }
-
-    if (clockSynced) return;
 
     // Unsigned arithmetic, so millis() rollover is fine.
     unsigned long now = millis();
-    if (asked && now - lastRequest < TIME_SYNC_INTERVAL_MS) return;
+    if (now - lastCheck < NTP_CHECK_INTERVAL_MS) return;
+    lastCheck = now;
 
-    lastRequest = now;
-    asked = true;
-    logf("Clock not set: asking the network for the time on UDP port %d", TIME_SYNC_PORT);
-    requestTimeSync();
+    time_t epoch = time(nullptr);
+    if (epoch < MIN_VALID_EPOCH) return;  // nothing has answered yet
+
+    if (!clockSynced) {
+        applyTime(epoch, "NTP");
+        return;
+    }
+
+    // SNTP keeps polling hourly for the rest of the feeder's life, so the clock
+    // stays trued up against the crystal's drift with nobody pushing anything.
+    // Reading COMPLETED clears it, so this is an edge and each sync is seen
+    // once. It is deliberately not logged: a line an hour would bury the log in
+    // noise to say what GET /api/time answers on demand. Missing an edge only
+    // leaves lastSyncEpoch older than it really is, which makes `stale` read
+    // pessimistic rather than wrong in the direction that matters.
+    if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) lastSyncEpoch = epoch;
 }
 
 void handleSetTime() {
@@ -712,14 +726,13 @@ void handleSetTime() {
     if (!readBody(doc)) return;
 
     long long epoch = 0;
-    long offset = 0;
-    const char* why = timeFromJson(doc.as<JsonObjectConst>(), epoch, offset);
+    const char* why = timeFromJson(doc.as<JsonObjectConst>(), epoch);
     if (why) {
         sendError(400, why);
         return;
     }
 
-    applyTime(epoch, offset, "a pushed request");
+    applyTime(epoch, "a pushed request");
 
     JsonDocument res;
     clockToJson(res.to<JsonObject>());
@@ -784,6 +797,40 @@ void handleNotFound() {
     sendError(404, "No such endpoint");
 }
 
+// Keeps WiFi coming back without ever waiting for it. Called from loop() on
+// every pass, including the very first: setup() only asks for a connection, and
+// this is what notices it arrived.
+static void serviceWifi() {
+    static bool wasConnected = false;
+    static unsigned long lastAttempt = 0;
+    static unsigned long lostAt = 0;
+
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!wasConnected) {
+            wasConnected = true;
+            // First line out after an outage, and the first the LAN hears at
+            // all: logLine() only broadcasts while connected, so the matching
+            // "lost" line above reached the serial cable alone.
+            logf("WiFi connected after %lus, IP: %s", (millis() - lostAt) / 1000,
+                 WiFi.localIP().toString().c_str());
+        }
+        return;
+    }
+
+    if (wasConnected) {
+        wasConnected = false;
+        lostAt = millis();
+        logLine("WiFi connection lost; retrying in the background, meals continue");
+    }
+
+    // Unsigned arithmetic, so millis() rollover is fine.
+    unsigned long now = millis();
+    if (now - lastAttempt < WIFI_RETRY_INTERVAL_MS) return;
+
+    lastAttempt = now;
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
 void setup() {
     Serial.begin(115200);
 
@@ -800,14 +847,14 @@ void setup() {
         logLine("WARNING: could not open NVS; schedule will not persist");
     }
 
+    // The zone rule is ours before any clock is: whenever an epoch does arrive,
+    // local time is right immediately, NTP or not.
+    setenv("TZ", POSIX_TZ, 1);
+    tzset();
+
     WiFi.setSleep(false);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-    logf("Connected, IP: %s", WiFi.localIP().toString().c_str());
+    logLine("Connecting to WiFi in the background");
 
     server.on("/api/settings", HTTP_GET, handleGetSettings);
     server.on("/api/meals", HTTP_GET, handleGetSettings);
@@ -822,31 +869,22 @@ void setup() {
     server.begin();
     logf("Listening for HTTP on port %d", HTTP_PORT);
 
-    // Bound before the first request so the reply has somewhere to land.
-    syncUdp.begin(TIME_SYNC_PORT);
     logf("Streaming logs to UDP port %d", LOG_PORT);
-    logLine("Clock not set: no meal will be served until it is");
-    serviceTimeSync();
+    logLine("Clock not set: no meal will be served until NTP answers");
 }
 
 void loop() {
 
-    if (WiFi.status() != WL_CONNECTED) {
-        logLine("WiFi connection lost! Reconnecting...");
-        while (WiFi.status() != WL_CONNECTED) {
-            delay(500);
-            Serial.print(".");
-        }
-        logf("Connected, IP: %s", WiFi.localIP().toString().c_str());
-    }
+    serviceWifi();
 
     server.handleClient();
-    serviceTimeSync();
+    serviceNtp();
 
     static unsigned long lastCheck = 0;
     unsigned long now = millis();
     if (now - lastCheck >= 1000) {  // unsigned arithmetic, so millis() rollover is fine
         lastCheck = now;
+        refreshTzOffset();  // cheap, and a switchover must not wait on the network
         serviceSchedule();
     }
 }

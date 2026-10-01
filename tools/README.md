@@ -15,12 +15,10 @@ else `192.168.1.244`. Add it to your `PATH` or alias it if you use it often.
     catfeeder status                    the clock and the meal schedule
     catfeeder feed [N]                  dispense N portions now (default 1)
     catfeeder time                      what the feeder thinks the time is
-    catfeeder sync-time                 push this computer's clock to the feeder
     catfeeder meals                     list the schedule
     catfeeder meals add 07:30 2         two portions at 07:30 every day
     catfeeder meals set 0 08:15 1       replace meal 0
     catfeeder meals rm 0                delete meal 0
-    catfeeder serve-time                answer the feeder's requests for the time
     catfeeder logs                      follow the feeder's log stream
     catfeeder record                    write the log stream to a file per day
 
@@ -46,35 +44,46 @@ sensor (100-60000, default 10000).
 
 ### The clock
 
-The feeder has no RTC battery and no route off the LAN, so it learns the time
-from this computer and **will not feed until it has been synced**:
+The feeder has no RTC battery, so after a power cut it has no idea what time it
+is and **will not feed until it has one**:
 
     $ catfeeder status
-    clock:  NOT SYNCED - the feeder will not feed until it is (run: catfeeder sync-time)
+    clock:  NOT SYNCED - the feeder will not feed until NTP answers (needs a route to the internet)
 
-It can be told the time two ways, and both are wanted.
+It fixes that itself. Once WiFi is up it asks `pool.ntp.org` for the time over
+NTP, and keeps asking in the background for the rest of its life, so the clock
+is also trued up against the crystal's drift without anyone doing anything. A
+clock last synced over 14 days ago shows `[STALE]`.
 
-**The feeder asks.** On startup, and every 30 seconds for as long as its clock
-is unset, it broadcasts a request on UDP port 3956. `catfeeder serve-time`
-answers with this computer's time:
+NTP answers in UTC only. The feeder turns that into local time using a zone
+rule compiled into the firmware, `POSIX_TZ` in `src/main.cpp`:
 
-    $ catfeeder serve-time
-    09:14:02  answering sync requests on UDP port 3956
-    09:14:07  192.168.1.244 asked for the time, sent 09:14:07 UTC-04:00
+    EST5EDT,M3.2.0,M11.1.0
 
-It broadcasts because this computer's address is not fixed and is the one that
-moves; nothing has to be configured on the feeder. Run it resident with
-`catfeeder-timeserver.plist` (below) and a feeder that reboots at 03:00 is
-feeding again by 03:00, without anyone awake.
+That is America/New_York: five hours west of UTC (POSIX inverts the sign),
+daylight time from the second Sunday in March to the first in November. The
+switchovers are rules rather than dates, so they are worked out arithmetically
+for any year — no calendar data to ship and nothing to keep up to date. The
+feeder re-checks the rule every second, so it follows a switchover within a
+second of it happening even if the network is down. **If the law ever moves
+those dates, that line is what has to be reflashed.** Moving the feeder to
+another zone is the same one-line change.
 
-**Or you push.** `catfeeder sync-time` POSTs to `/api/time`, as before, and
-`catfeeder-timesync.plist` does that daily. This is still the only way to
-*correct* a clock that is already set: once synced, the feeder ignores sync
-replies, so nothing on the network can quietly move a working clock. Drift is
-what the daily push is for, and a clock synced over 14 days ago shows `[STALE]`.
+`catfeeder time` shows what it has settled on, including the rule in `--json`:
 
-Nothing answering is not an error. The feeder asks again in 30 seconds, for as
-long as it takes.
+    $ catfeeder time
+    clock:  local 09:14, UTC-04:00, synced 2m ago
+
+**If there is no route to the internet,** NTP cannot answer and the feeder stays
+parked. `POST /api/time` is the manual way out:
+
+    curl -X POST http://192.168.1.244/api/time \
+        -H 'Content-Type: application/json' \
+        -d "{\"epoch\":$(date +%s)}"
+
+It takes a UTC epoch and nothing else — the zone is the feeder's own business,
+so there is no offset to get wrong. NTP will correct whatever you push the next
+time it is reachable.
 
 ### The schedule
 
@@ -98,7 +107,7 @@ Everything the feeder logs to its serial console is also broadcast on UDP port
 
     $ catfeeder logs
     09:14:01  following the log on UDP port 3957
-    09:14:07  Clock synced from 192.168.1.9: local time 09:14 (UTC-4:00)
+    09:14:07  Clock synced from NTP: local time 09:14 (UTC-4:00)
     09:29:58  192.168.1.9 GET /api/settings -> 200
     09:30:00  MealEvent: serving 2 portion(s) (scheduled for 07:30)
     09:30:04  Dispense: portion 1 of 2
@@ -143,32 +152,6 @@ midnight, appends rather than truncating, and writes a line at a time so
 gitignored. Run it resident with `catfeeder-logger.plist`, below, and it shares
 the port, so `catfeeder logs` still works alongside it.
 
-## catfeeder-timesync.plist
-
-A launchd agent that runs `sync-time.sh` daily at 09:00, plus at load, so the
-feeder's clock stays correct without anyone remembering to do it. Install:
-
-    cp tools/catfeeder-timesync.plist ~/Library/LaunchAgents/local.catfeeder.timesync.plist
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.catfeeder.timesync.plist
-
-The plist has the path to this checkout baked in; edit it if the repo moves.
-Output goes to `/tmp/catfeeder-timesync.log`.
-
-## catfeeder-timeserver.plist
-
-A launchd agent that keeps `catfeeder serve-time` running, so there is always
-something to answer the feeder when it comes back from a power cut. Install:
-
-    cp tools/catfeeder-timeserver.plist ~/Library/LaunchAgents/local.catfeeder.timeserver.plist
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.catfeeder.timeserver.plist
-
-macOS may ask once whether python3 may accept incoming connections. It needs
-to, or the feeder's broadcast never arrives. Output goes to
-`/tmp/catfeeder-timeserver.log`.
-
-Being asleep is the one thing it cannot work around: a sleeping laptop answers
-nothing, and the feeder waits, asking, until it wakes.
-
 ## catfeeder-logger.plist
 
 A launchd agent that keeps `catfeeder record` running, so the log is on disk
@@ -180,8 +163,3 @@ without anyone remembering to start it. Install:
 Its own output — which file it is writing to — goes to
 `/tmp/catfeeder-logger.log`. Nothing prunes `logs/`, so it grows for as long as
 the feeder keeps talking; a few hundred kilobytes a year at the current rate.
-
-## sync-time.sh
-
-`catfeeder sync-time` does the same job. This one stays because the launchd
-agent runs it, and because curl is there on a machine with no Python.
