@@ -17,7 +17,6 @@ else `192.168.1.244`. Add it to your `PATH` or alias it if you use it often.
     catfeeder time                      what the feeder thinks the time is
     catfeeder meals                     list the schedule
     catfeeder meals add 07:30 2         two portions at 07:30 every day
-    catfeeder meals set 0 08:15 1       replace meal 0
     catfeeder meals rm 0                delete meal 0
     catfeeder logs                      follow the feeder's log stream
     catfeeder record                    write the log stream to a file per day
@@ -88,17 +87,48 @@ time it is reachable.
 ### The schedule
 
 Meals are a time of day plus a portion count, up to 8 of them, kept in flash.
-The schedule is always in time order, so adding a meal, or editing one's time,
-drops it into place rather than onto the end.
+The schedule is always in time order, so a new meal drops into place rather than
+onto the end. There is no way to change a meal: delete it and add the one you
+want.
 
-Meals are addressed by their position in that order, which means **any edit can
-renumber the others** — run `catfeeder meals` between edits rather than working
-from a stale listing.
+Meals are addressed by their position in that order, which means **adding or
+removing one can renumber the others** — run `catfeeder meals` between edits
+rather than working from a stale listing.
 
-A meal already served today stays served, so moving its time later in the day
-does not feed the cat twice. If a write reaches the schedule but not flash, the
-output says `[NOT SAVED to flash]`: the change is live but will not survive a
-reboot.
+If a write reaches the schedule but not flash, the output says
+`[NOT SAVED to flash]`: the change is live but will not survive a reboot.
+
+### Catching up after an outage
+
+Flash records the day each meal last fed, written the moment it is served. A
+feeder that comes back mid-day therefore knows exactly what the cat has already
+had, and **serves whatever it missed, straight away**:
+
+    14:01:58  Clock synced from NTP: local time 14:01 (UTC-4:00)
+    14:01:59  MealEvent: serving 1 portion(s) scheduled for 12:00, 2h01m late (its time went by while the feeder was down)
+    14:02:04  MealEvent: served 1 of 1 portion(s)
+
+A meal that already fed before the restart is not served again — flash says it
+fed today, and that is the end of it. `catfeeder status` shows which are done:
+
+    $ catfeeder status
+    clock:  local 14:02, UTC-04:00, synced 1m ago
+    meals:  2 scheduled
+      [0] 07:30  2 portions  fed today
+      [1] 12:00  1 portion   fed today
+
+Catch-up is oldest first, since the schedule is in time order. Note that it has
+no window: a feeder that was off from breakfast until the evening serves every
+meal it missed, back to back, as soon as it has the time. The hopper empties into
+the bowl rather than the cat going without.
+
+A meal **added** after its own time today is a different case and is not caught
+up: it did not exist when its slot went by, so it is stamped as settled for today
+and starts tomorrow.
+
+The one hole is a flash write that fails at the moment of feeding, which logs
+`fed, but could not record it to flash`. A restart the same day would then feed
+that meal a second time.
 
 ## Live logs
 
@@ -112,7 +142,7 @@ Everything the feeder logs to its serial console is also broadcast on UDP port
     09:30:00  MealEvent: serving 2 portion(s) (scheduled for 07:30)
     09:30:04  Dispense: portion 1 of 2
     09:31:12  192.168.1.9 POST /api/meals -> 201
-    09:31:40  192.168.1.9 PUT /api/meals/9 -> 404
+    09:31:40  192.168.1.9 DELETE /api/meals/9 -> 404
 
 Every API call is logged that way — who asked, what for, and what they got —
 including the ones refused before a handler ran, so a client getting a 400 shows

@@ -56,6 +56,12 @@
 
 #define MEAL_NEVER_FIRED (-1L)
 
+// A meal served this many minutes past its time is a catch-up rather than a
+// meal on time, and is logged as one. The scheduler ticks every second, so an
+// on-time meal is late by 0; the slack is for a meal that had to queue behind a
+// long dispense.
+#define MEAL_LATE_MINUTES 2
+
 // DRV8833 channel A. The auger only ever turns one way, so IN2 stays low and
 // IN1 does all the work; both low is the driver's coast mode.
 #define MOTOR_IN1_PIN 22
@@ -88,22 +94,28 @@
 #define NVS_NAMESPACE "catfeeder"
 #define NVS_KEY_VERSION "ver"
 #define NVS_KEY_MEALS "meals"
-#define SCHEDULE_FORMAT_VERSION 1
+#define SCHEDULE_FORMAT_VERSION 2
 
 typedef struct {
 
     int portions;
     int timeOfDay;    // minutes since local midnight
-    long lastFiredDay;  // local day number we last fed this meal on, or MEAL_NEVER_FIRED
+
+    // The local day this meal is settled for, or MEAL_NEVER_FIRED. Normally the
+    // day it last fed, written to flash as it is served, so a feeder that comes
+    // back mid-day knows what the cat has already had. A meal added after its
+    // own time is stamped with today too: it is settled without feeding, rather
+    // than dispensing the moment it is created.
+    long lastFiredDay;
 
 } Meal;
 
-// What actually goes to flash. Only the schedule itself: which meals were
-// already served is runtime state, and armSchedule() rebuilds it at sync time.
+// What goes to flash: the schedule, and what has actually been served off it.
 typedef struct {
 
     int16_t portions;
     int16_t timeOfDay;
+    int32_t lastFiredDay;
 
 } StoredMeal;
 
@@ -199,6 +211,7 @@ static bool saveSchedule() {
     for (int i = 0; i < numMeals; i++) {
         stored[i].portions = (int16_t)meals[i].portions;
         stored[i].timeOfDay = (int16_t)meals[i].timeOfDay;
+        stored[i].lastFiredDay = (int32_t)meals[i].lastFiredDay;
     }
 
     size_t bytes = (size_t)numMeals * sizeof(StoredMeal);
@@ -246,7 +259,13 @@ static void loadSchedule() {
         Meal meal;
         meal.portions = stored[i].portions;
         meal.timeOfDay = stored[i].timeOfDay;
-        meal.lastFiredDay = MEAL_NEVER_FIRED;
+        meal.lastFiredDay = stored[i].lastFiredDay;
+
+        // Only MEAL_NEVER_FIRED or a real day number mean anything. A negative
+        // day that is not the sentinel is damage, and serviceSchedule() deals
+        // with one that turns out to be in the future.
+        if (meal.lastFiredDay < MEAL_NEVER_FIRED) meal.lastFiredDay = MEAL_NEVER_FIRED;
+
         insertMeal(meal);  // a schedule saved before meals were ordered
     }
 
@@ -378,34 +397,29 @@ static int dispensePortions(int portions, unsigned long timeoutMs) {
     return served;
 }
 
-static void MealEvent(const Meal& meal) {
-    logf("MealEvent: serving %d portion(s) (scheduled for %02d:%02d)", meal.portions,
-         meal.timeOfDay / 60, meal.timeOfDay % 60);
+static void MealEvent(const Meal& meal, int minutesLate) {
+    if (minutesLate >= MEAL_LATE_MINUTES) {
+        logf("MealEvent: serving %d portion(s) scheduled for %02d:%02d, %dh%02dm late"
+             " (its time went by while the feeder was down)",
+             meal.portions, meal.timeOfDay / 60, meal.timeOfDay % 60, minutesLate / 60,
+             minutesLate % 60);
+    } else {
+        logf("MealEvent: serving %d portion(s) (scheduled for %02d:%02d)", meal.portions,
+             meal.timeOfDay / 60, meal.timeOfDay % 60);
+    }
 
     int served = dispensePortions(meal.portions, PORTION_TIMEOUT_MS);
 
     logf("MealEvent: served %d of %d portion(s)", served, meal.portions);
 }
 
-// Marks meals whose time has already passed today as done, so that a device
-// that boots (or gets its clock) in the evening does not immediately dump the
-// whole day's meals into the bowl at once.
-static void armSchedule() {
-    if (!clockSynced) return;
-
-    time_t local = localNow();
-    long today = localDay(local);
-    int minute = localMinuteOfDay(local);
-
-    for (int i = 0; i < numMeals; i++) {
-        if (meals[i].lastFiredDay == MEAL_NEVER_FIRED && minute >= meals[i].timeOfDay) {
-            meals[i].lastFiredDay = today;
-        }
-    }
-}
-
-// Feeds any meal whose time arrived since the last check. Called once a second
-// from loop(); a meal fires at most once per local day.
+// Feeds any meal whose time has arrived and that flash does not already account
+// for. Called once a second from loop(), and a meal fires at most once per local
+// day.
+//
+// This is also the catch-up: a meal whose slot went by while the feeder was down
+// has nothing recorded against today, so the first tick after the clock arrives
+// serves it. Meals are in time order, so a run of them catches up oldest first.
 static void serviceSchedule() {
     if (!clockSynced) return;
 
@@ -414,11 +428,28 @@ static void serviceSchedule() {
     int minute = localMinuteOfDay(local);
 
     for (int i = 0; i < numMeals; i++) {
+        // A settled day in the future is damaged flash, or a clock that has
+        // since moved backwards. Trusting it would park the meal for good.
+        if (meals[i].lastFiredDay > today) {
+            logf("Meal %d is settled for a day in the future; forgetting that", i);
+            meals[i].lastFiredDay = MEAL_NEVER_FIRED;
+        }
+
+        if (minute < meals[i].timeOfDay) continue;
+
         // `<` rather than `!=` so a clock correction that moves us backwards
         // cannot make a meal fire twice.
-        if (meals[i].lastFiredDay < today && minute >= meals[i].timeOfDay) {
-            meals[i].lastFiredDay = today;
-            MealEvent(meals[i]);
+        if (!(meals[i].lastFiredDay < today)) continue;
+
+        meals[i].lastFiredDay = today;
+        MealEvent(meals[i], minute - meals[i].timeOfDay);
+
+        // Written now rather than at the next schedule edit: the whole point of
+        // keeping this is that a restart two minutes from now knows the cat has
+        // already been fed.
+        if (!saveSchedule()) {
+            logLine("WARNING: fed, but could not record it to flash;"
+                    " a restart today may feed this meal again");
         }
     }
 }
@@ -455,6 +486,12 @@ static void sendError(int code, const char* message) {
 static void mealToJson(const Meal& meal, JsonObject obj) {
     obj["timeOfDay"] = meal.timeOfDay;
     obj["portions"] = meal.portions;
+
+    // Without a date these mean nothing, and saying "not fed today" when there
+    // is no today would read as a missed meal.
+    if (!clockSynced) return;
+
+    obj["fedToday"] = meal.lastFiredDay == localDay(localNow());
 }
 
 static void clockToJson(JsonObject obj) {
@@ -513,6 +550,16 @@ static bool readBody(JsonDocument& doc) {
 
 // Pulls a meal out of a JSON object. Returns false (and answers the request)
 // when a field is missing or out of range.
+// A meal created after its own time today is skipped rather than served: it did
+// not exist when its slot went by, so there is nothing to catch up on. Stamping
+// it with today settles it until tomorrow.
+static void skipIfTimePassed(Meal& meal) {
+    if (!clockSynced) return;
+
+    time_t local = localNow();
+    if (localMinuteOfDay(local) >= meal.timeOfDay) meal.lastFiredDay = localDay(local);
+}
+
 static bool mealFromJson(JsonObjectConst obj, Meal& meal) {
     if (!obj["timeOfDay"].is<int>() || !obj["portions"].is<int>()) {
         sendError(400, "Expected integer fields 'timeOfDay' and 'portions'");
@@ -578,8 +625,8 @@ void handleAddMeal() {
     Meal meal;
     if (!mealFromJson(doc.as<JsonObjectConst>(), meal)) return;
 
+    skipIfTimePassed(meal);
     int index = insertMeal(meal);
-    armSchedule();  // don't serve a meal whose time passed before it existed
     bool persisted = saveSchedule();
     logf("Added meal %d: %d portions at %d", index, meal.portions, meal.timeOfDay);
 
@@ -588,40 +635,6 @@ void handleAddMeal() {
     res["persisted"] = persisted;
     mealToJson(meal, res["meal"].to<JsonObject>());
     sendJson(201, res);
-}
-
-// PUT /api/meals/<index> -> replace a meal.
-void handleChangeMeal() {
-    int index = mealIndexFromUri();
-    if (index < 0) return;
-
-    JsonDocument doc;
-    if (!readBody(doc)) return;
-
-    Meal meal;
-    if (!mealFromJson(doc.as<JsonObjectConst>(), meal)) return;
-
-    // A meal already served today stays served, so moving its time later in the
-    // day does not feed the cat a second time.
-    if (meals[index].lastFiredDay != MEAL_NEVER_FIRED) {
-        meal.lastFiredDay = meals[index].lastFiredDay;
-    }
-
-    // A new time belongs somewhere else in the schedule, so the meal moves and
-    // the index in the response is not necessarily the one that was asked for.
-    removeMeal(index);
-    int newIndex = insertMeal(meal);
-
-    armSchedule();
-    bool persisted = saveSchedule();
-    logf("Changed meal %d: %d portions at %d (now meal %d)", index, meal.portions,
-         meal.timeOfDay, newIndex);
-
-    JsonDocument res;
-    res["index"] = newIndex;
-    res["persisted"] = persisted;
-    mealToJson(meal, res["meal"].to<JsonObject>());
-    sendJson(200, res);
 }
 
 // DELETE /api/meals/<index> -> drop a meal, closing the gap it leaves.
@@ -674,7 +687,6 @@ static void applyTime(long long epoch, const char* source) {
     refreshTzOffset();  // the zone rule, now that there is an instant to apply it to
     lastSyncEpoch = (time_t)epoch;
     clockSynced = true;
-    armSchedule();
 
     time_t local = localNow();
     logf("Clock synced from %s: local time %02d:%02d (UTC%+ld:%02ld)", source,
@@ -859,7 +871,6 @@ void setup() {
     server.on("/api/settings", HTTP_GET, handleGetSettings);
     server.on("/api/meals", HTTP_GET, handleGetSettings);
     server.on("/api/meals", HTTP_POST, handleAddMeal);
-    server.on(UriBraces("/api/meals/{}"), HTTP_PUT, handleChangeMeal);
     server.on(UriBraces("/api/meals/{}"), HTTP_DELETE, handleDeleteMeal);
     server.on("/api/time", HTTP_GET, handleGetTime);
     server.on("/api/time", HTTP_POST, handleSetTime);

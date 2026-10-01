@@ -191,8 +191,12 @@ def meal_lines(meals):
 
     lines = ["meals:  {} scheduled".format(len(meals))]
     for index, meal in enumerate(meals):
-        lines.append("  [{}] {}  {}".format(
-            index, fmt_minutes(meal["timeOfDay"]), fmt_portions(meal["portions"])))
+        # Absent when the feeder has no clock, in which case today means nothing
+        # and there is nothing to say about it either way.
+        fed = "  fed today" if meal.get("fedToday") else ""
+
+        lines.append("  [{}] {}  {}{}".format(
+            index, fmt_minutes(meal["timeOfDay"]), fmt_portions(meal["portions"]), fed))
     return lines
 
 
@@ -239,14 +243,6 @@ def cmd_meal_add(args):
                    {"timeOfDay": args.at, "portions": args.portions})
     show(args, data, ["added {}  {}{}".format(
         fmt_minutes(data["meal"]["timeOfDay"]),
-        fmt_portions(data["meal"]["portions"]), unsaved(data))])
-
-
-def cmd_meal_set(args):
-    data = request(args, "PUT", "/api/meals/{}".format(args.index),
-                   {"timeOfDay": args.at, "portions": args.portions})
-    show(args, data, ["meal {} is now {}  {}{}".format(
-        args.index, fmt_minutes(data["meal"]["timeOfDay"]),
         fmt_portions(data["meal"]["portions"]), unsaved(data))])
 
 
@@ -426,12 +422,6 @@ def build_parser():
     add.add_argument("at", type=parse_time_of_day, metavar="HH:MM")
     add.add_argument("portions", type=portions_arg)
     add.set_defaults(func=cmd_meal_add)
-
-    change = meals_sub.add_parser("set", help="replace a meal by index")
-    change.add_argument("index", type=int)
-    change.add_argument("at", type=parse_time_of_day, metavar="HH:MM")
-    change.add_argument("portions", type=portions_arg)
-    change.set_defaults(func=cmd_meal_set)
 
     remove = meals_sub.add_parser("rm", help="delete a meal by index")
     remove.add_argument("index", type=int)
