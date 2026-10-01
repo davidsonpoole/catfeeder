@@ -1,7 +1,8 @@
 # tools
 
-Host-side tools for the cat feeder. The feeder itself is an ESP32 running
-`src/main.cpp`, which serves a JSON API over HTTP on port 80.
+Host-side tools for the cat feeder, and how to get firmware onto it. The feeder
+itself is an ESP32 running `src/main.cpp`, which serves a JSON API over HTTP on
+port 80.
 
 ## catfeeder
 
@@ -193,3 +194,60 @@ without anyone remembering to start it. Install:
 Its own output — which file it is writing to — goes to
 `/tmp/catfeeder-logger.log`. Nothing prunes `logs/`, so it grows for as long as
 the feeder keeps talking; a few hundred kilobytes a year at the current rate.
+
+## Flashing
+
+Over USB:
+
+    pio run -t upload
+
+Add `--upload-port /dev/cu.usbserial-0001` when more than one serial device is
+attached, and `pio device monitor` to follow the serial console afterwards.
+
+**Do not leave USB connected while the board runs from an external supply**,
+unless its schematic shows proper supply ORing. On many dev boards USB 5V and the
+`5V` pin are tied together and the two sources fight, backfeeding the laptop's
+port; driving the `3V3` pin while USB is connected pushes current backwards
+through the onboard regulator's output, which most regulators do not survive.
+Power from one source at a time: USB while developing, external once deployed.
+
+### Over WiFi
+
+    export CATFEEDER_OTA_PASSWORD='...'        # the value is in src/wifi_secrets.h
+    pio run -e esp32dev_ota -t upload
+
+The feeder answers to `catfeeder.local`, set by `OTA_HOSTNAME` in `src/main.cpp`.
+Where mDNS does not work, give the address instead:
+
+    pio run -e esp32dev_ota -t upload --upload-port 192.168.1.244
+
+The password lives in `src/wifi_secrets.h`, which is gitignored, and
+`platformio.ini` reads it from the environment so it never lands in the repo.
+Without one, anyone on the network could install their own firmware on the
+feeder, which is a good deal worse than being able to dispense a portion.
+
+An update arriving mid-meal waits for the meal: `ArduinoOTA.handle()` is only
+reached from `loop()`, and a dispense does not return there until it has counted
+its portions. The motor is stopped before the write regardless, so an update
+landing between portions cannot leave the auger turning through the reboot.
+
+A failed upload costs nothing. `otadata` still points at the slot the feeder is
+running from, so it keeps running the firmware it has and you can retry.
+
+### What still needs a cable
+
+    nvs       0x009000 .. 0x00E000   the saved schedule, and what has been fed today
+    otadata   0x00E000 .. 0x010000   which app slot to boot
+    app0      0x010000 .. 0x200000   1.94 MiB
+    app1      0x200000 .. 0x3F0000   1.94 MiB
+    coredump  0x3F0000 .. 0x400000
+
+An OTA writes only the app slot the feeder is *not* running from. The bootloader
+at `0x1000` and the partition table at `0x8000` are never touched, so editing
+`partitions.csv` means a USB flash -- as does recovering firmware that does not
+boot. A flash leaves `nvs` alone, so the schedule and today's feeding record
+survive both kinds of update.
+
+**Firmware with the wrong WiFi credentials cannot be fixed over the air.** That
+is the one way to lose a feeder you have put somewhere awkward. Commit before you
+push, so whatever is running is something you can rebuild.

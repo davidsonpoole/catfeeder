@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -31,6 +32,11 @@
 // The interval is generous because a begin() while an association is already in
 // flight starts that association over.
 #define WIFI_RETRY_INTERVAL_MS 30000
+
+// What the feeder calls itself for an over-the-air update, so a flash is
+// `--upload-port catfeeder.local` rather than an address that moves whenever the
+// network does.
+#define OTA_HOSTNAME "catfeeder"
 
 // The feeder gets the time from the internet and works out local time itself,
 // so nothing on the LAN has to be awake for the cat to be fed. NTP only ever
@@ -809,6 +815,38 @@ void handleNotFound() {
     sendError(404, "No such endpoint");
 }
 
+static bool otaReady = false;
+
+// Over-the-air updates, so a change does not need the board on a cable. Started
+// on the first connection rather than from setup(), which no longer waits for
+// WiFi, and only once -- a reconnect must not register the handlers again.
+static void startOta() {
+    if (otaReady) return;
+
+    ArduinoOTA.setHostname(OTA_HOSTNAME);
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+
+    ArduinoOTA.onStart([]() {
+        // An update landing between portions must not leave the auger turning
+        // through the write and the reboot that follows it.
+        motorStop();
+        logLine("OTA: update starting, the feeder will reboot when it lands");
+    });
+
+    ArduinoOTA.onEnd([]() { logLine("OTA: update written, rebooting"); });
+
+    ArduinoOTA.onError([](ota_error_t error) {
+        // Nothing has been committed at this point: otadata still points at the
+        // partition we are running from, so a failure costs nothing but a retry.
+        logf("OTA: update failed (error %u), still running the old firmware",
+             (unsigned)error);
+    });
+
+    ArduinoOTA.begin();
+    otaReady = true;
+    logf("OTA updates enabled as %s.local", OTA_HOSTNAME);
+}
+
 // Keeps WiFi coming back without ever waiting for it. Called from loop() on
 // every pass, including the very first: setup() only asks for a connection, and
 // this is what notices it arrived.
@@ -825,6 +863,7 @@ static void serviceWifi() {
             // "lost" line above reached the serial cable alone.
             logf("WiFi connected after %lus, IP: %s", (millis() - lostAt) / 1000,
                  WiFi.localIP().toString().c_str());
+            startOta();
         }
         return;
     }
@@ -889,6 +928,7 @@ void loop() {
     serviceWifi();
 
     server.handleClient();
+    if (otaReady) ArduinoOTA.handle();
     serviceNtp();
 
     static unsigned long lastCheck = 0;

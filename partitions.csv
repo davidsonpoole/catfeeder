@@ -1,0 +1,16 @@
+# Two OTA app slots, sized to use the whole 4MB chip.
+#
+# SPIFFS is gone: the schedule lives in NVS and nothing here has ever used a
+# filesystem, so that 1.4MB was dead weight. Each app slot is ~1.94MB instead of
+# the 1.25MB the stock arduino-esp32 table gives, which leaves room for a
+# firmware that OTA could not otherwise deliver.
+#
+# nvs stays at its stock offset and size on purpose -- move it and the saved
+# meal schedule goes with it. App partitions must stay 0x10000-aligned.
+#
+# Name,     Type, SubType, Offset,   Size
+nvs,        data, nvs,     0x9000,   0x5000,
+otadata,    data, ota,     0xe000,   0x2000,
+app0,       app,  ota_0,   0x10000,  0x1F0000,
+app1,       app,  ota_1,   0x200000, 0x1F0000,
+coredump,   data, coredump,0x3F0000, 0x10000,
