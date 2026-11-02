@@ -6,12 +6,12 @@ API so the curl incantations live in the repo instead of in shell history.
 
 The host comes from --host, else $CATFEEDER_HOST, else the default below.
 
-    catfeeder status             what is on the schedule, and is the clock set
-    catfeeder feed 2             dispense two portions now
-    catfeeder meals add 07:30 2  feed two portions at 07:30 every day
-    catfeeder time               what the feeder thinks the time is
-    catfeeder logs               follow the feeder's log stream
-    catfeeder record             write the log stream to a file per day
+    catfeeder status                what is on the schedule, and is the clock set
+    catfeeder feed 2                dispense two portions now
+    catfeeder meals add 07:30 2     feed two portions at 07:30 every day
+    catfeeder meals modify 07:30 3  change the 07:30 meal to three portions
+    catfeeder logs                  follow the feeder's log stream
+    catfeeder record                write the log stream to a file per day
 """
 
 import argparse
@@ -48,6 +48,15 @@ PORTION_TIMEOUT_MAX_MS = 60000
 class FeederError(Exception):
     """A request the feeder refused, or could not be made at all."""
 
+    def __init__(self, message, code=None, detail=None):
+        super().__init__(message)
+        # The HTTP status and the feeder's own wording, where it answered at
+        # all. None covers the errors that never reached it, so a caller
+        # testing for one particular refusal cannot mistake an unreachable
+        # feeder -- or a feeder that has never heard of the endpoint -- for it.
+        self.code = code
+        self.detail = detail
+
 
 def die(message):
     print("catfeeder: " + message, file=sys.stderr)
@@ -74,7 +83,9 @@ def request(args, method, path, body=None, params=None, timeout=10):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as err:
-        raise FeederError("{} {}: {}".format(err.code, err.reason, http_error_detail(err)))
+        detail = http_error_detail(err)
+        raise FeederError(
+            "{} {}: {}".format(err.code, err.reason, detail), err.code, detail)
     except urllib.error.URLError as err:
         raise FeederError("cannot reach {}: {}".format(args.host, err.reason))
     except socket.timeout:  # an alias of TimeoutError only from Python 3.10
@@ -89,6 +100,8 @@ def http_error_detail(err):
         body = json.loads(err.read())
     except Exception:
         return "no details"
+    if not isinstance(body, dict):
+        return json.dumps(body)
     return body.get("error", json.dumps(body))
 
 
@@ -228,22 +241,50 @@ def cmd_feed(args):
         raise SystemExit(1)
 
 
-def cmd_time(args):
-    data = request(args, "GET", "/api/time")
-    show(args, data, clock_lines(data))
-
-
 def cmd_meals(args):
     data = request(args, "GET", "/api/meals")
     show(args, data, meal_lines(data.get("meals", [])))
 
 
 def cmd_meal_add(args):
-    data = request(args, "POST", "/api/meals",
-                   {"timeOfDay": args.at, "portions": args.portions})
+    try:
+        data = request(args, "POST", "/api/meals",
+                       {"timeOfDay": args.at, "portions": args.portions})
+    except FeederError as err:
+        # Only one meal per time, so point at the command that changes the one
+        # already there. Matched on the wording as well as the status, because
+        # a malformed meal is a 400 too.
+        if err.code == 400 and (err.detail or "").startswith("Meal already"):
+            raise FeederError(
+                "there is already a meal at {} - `catfeeder meals modify` "
+                "changes its portions".format(fmt_minutes(args.at)))
+        raise
+
     show(args, data, ["added {}  {}{}".format(
         fmt_minutes(data["meal"]["timeOfDay"]),
         fmt_portions(data["meal"]["portions"]), unsaved(data))])
+
+
+def cmd_meal_modify(args):
+    try:
+        data = request(args, "PUT", "/api/meals",
+                       {"timeOfDay": args.at, "portions": args.portions})
+    except FeederError as err:
+        # A time with no meal on it is refused rather than turned into a new
+        # meal, so say which time missed in the client's own words instead of
+        # passing on a bare 404. Matched on the feeder's wording as well as the
+        # status, because a feeder too old to know this endpoint 404s the whole
+        # request, and reading that as an empty time would hide the real cause.
+        if err.code == 404 and (err.detail or "").startswith("No meal"):
+            raise FeederError(
+                "no meal scheduled at {} - `catfeeder meals` lists the times"
+                .format(fmt_minutes(args.at)))
+        raise
+
+    show(args, data, ["modified {}  {} (was {}){}".format(
+        fmt_minutes(data["meal"]["timeOfDay"]),
+        fmt_portions(data["meal"]["portions"]),
+        data["previousPortions"], unsaved(data))])
 
 
 def cmd_meal_rm(args):
@@ -404,7 +445,6 @@ def build_parser():
                                                           PORTION_TIMEOUT_MS))
     feed.set_defaults(func=cmd_feed)
 
-    sub.add_parser("time", help="show the feeder's clock").set_defaults(func=cmd_time)
     sub.add_parser("logs", help="follow the feeder's log stream (runs until stopped)"
                    ).set_defaults(func=cmd_logs)
 
@@ -422,6 +462,12 @@ def build_parser():
     add.add_argument("at", type=parse_time_of_day, metavar="HH:MM")
     add.add_argument("portions", type=portions_arg)
     add.set_defaults(func=cmd_meal_add)
+
+    modify = meals_sub.add_parser(
+        "modify", help="change the portions of the meal at a given time")
+    modify.add_argument("at", type=parse_time_of_day, metavar="HH:MM")
+    modify.add_argument("portions", type=portions_arg)
+    modify.set_defaults(func=cmd_meal_modify)
 
     remove = meals_sub.add_parser("rm", help="delete a meal by index")
     remove.add_argument("index", type=int)

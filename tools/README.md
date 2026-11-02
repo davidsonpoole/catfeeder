@@ -15,9 +15,9 @@ else `192.168.1.244`. Add it to your `PATH` or alias it if you use it often.
 
     catfeeder status                    the clock and the meal schedule
     catfeeder feed [N]                  dispense N portions now (default 1)
-    catfeeder time                      what the feeder thinks the time is
     catfeeder meals                     list the schedule
     catfeeder meals add 07:30 2         two portions at 07:30 every day
+    catfeeder meals modify 07:30 3      make the 07:30 meal three portions
     catfeeder meals rm 0                delete meal 0
     catfeeder logs                      follow the feeder's log stream
     catfeeder record                    write the log stream to a file per day
@@ -69,32 +69,35 @@ second of it happening even if the network is down. **If the law ever moves
 those dates, that line is what has to be reflashed.** Moving the feeder to
 another zone is the same one-line change.
 
-`catfeeder time` shows what it has settled on, including the rule in `--json`:
-
-    $ catfeeder time
-    clock:  local 09:14, UTC-04:00, synced 2m ago
-
-**If there is no route to the internet,** NTP cannot answer and the feeder stays
-parked. `POST /api/time` is the manual way out:
-
-    curl -X POST http://192.168.1.244/api/time \
-        -H 'Content-Type: application/json' \
-        -d "{\"epoch\":$(date +%s)}"
-
-It takes a UTC epoch and nothing else — the zone is the feeder's own business,
-so there is no offset to get wrong. NTP will correct whatever you push the next
-time it is reachable.
-
 ### The schedule
 
 Meals are a time of day plus a portion count, up to 8 of them, kept in flash.
 The schedule is always in time order, so a new meal drops into place rather than
-onto the end. There is no way to change a meal: delete it and add the one you
-want.
+onto the end.
 
 Meals are addressed by their position in that order, which means **adding or
 removing one can renumber the others** — run `catfeeder meals` between edits
 rather than working from a stale listing.
+
+`modify` is the exception: it finds the meal by its time, so it needs no index
+and nothing to be up to date.
+
+    $ catfeeder meals modify 07:30 3
+    modified 07:30  3 portions (was 2)
+
+Only the portions change, so the meal keeps its place and its record of having
+fed today — raising the portions after breakfast has gone out changes tomorrow's
+breakfast, it does not serve a second one. A time with no meal on it is refused
+rather than quietly turned into a new meal, so a typo cannot add one:
+
+    $ catfeeder meals modify 08:15 3
+    catfeeder: no meal scheduled at 08:15 - `catfeeder meals` lists the times
+
+To change a meal's *time*, there is still nothing for it but `rm` and `add`.
+There can be only one meal at a given time, so adding a second is refused:
+
+    $ catfeeder meals add 07:30 2
+    catfeeder: there is already a meal at 07:30 - `catfeeder meals modify` changes its portions
 
 If a write reaches the schedule but not flash, the output says
 `[NOT SAVED to flash]`: the change is live but will not survive a reboot.
@@ -139,7 +142,7 @@ Everything the feeder logs to its serial console is also broadcast on UDP port
     $ catfeeder logs
     09:14:01  following the log on UDP port 3957
     09:14:07  Clock synced from NTP: local time 09:14 (UTC-4:00)
-    09:29:58  192.168.1.9 GET /api/settings -> 200
+    09:29:58  192.168.1.9 GET /api/meals -> 200
     09:30:00  MealEvent: serving 2 portion(s) (scheduled for 07:30)
     09:30:04  Dispense: portion 1 of 2
     09:31:12  192.168.1.9 POST /api/meals -> 201

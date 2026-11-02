@@ -106,12 +106,6 @@ typedef struct {
 
     int portions;
     int timeOfDay;    // minutes since local midnight
-
-    // The local day this meal is settled for, or MEAL_NEVER_FIRED. Normally the
-    // day it last fed, written to flash as it is served, so a feeder that comes
-    // back mid-day knows what the cat has already had. A meal added after its
-    // own time is stamped with today too: it is settled without feeding, rather
-    // than dispensing the moment it is created.
     long lastFiredDay;
 
 } Meal;
@@ -133,19 +127,11 @@ WiFiUDP logUdp;  // send only: nothing ever answers a log line
 Meal meals[MAX_MEALS];
 int numMeals = 0;
 
-// Everything the feeder has to say goes through here: to the serial monitor as
-// before, and to anyone listening on the LAN for the live stream. Logging must
-// never fail a caller, so a line that cannot be broadcast is simply a line that
-// only reached the cable.
 static void logLine(const char* line) {
     Serial.println(line);
 
     if (WiFi.status() != WL_CONNECTED) return;
 
-    // Numbering the lines lets a viewer see what UDP dropped, which is the price
-    // of a transport that never blocks the feeder waiting on a listener. The
-    // counter only advances for a line that went out, so a gap means a loss
-    // rather than a line logged before the network was up.
     static unsigned long sent = 0;
     char packet[LOG_LINE_MAX + 24];
     int n = snprintf(packet, sizeof(packet), "%lu %s", sent + 1, line);
@@ -157,8 +143,6 @@ static void logLine(const char* line) {
     if (logUdp.endPacket()) sent++;
 }
 
-// The format attribute is what makes the compiler check these call sites the
-// way it checks printf's.
 static void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
 static void logf(const char* fmt, ...) {
@@ -172,13 +156,13 @@ static void logf(const char* fmt, ...) {
     logLine(line);
 }
 
-// The schedule is kept in time order, so it reads like a timetable and the
-// indices the API hands out follow the clock. Inserting into place is enough to
-// keep it that way, and walking back over equal times leaves meals that share a
-// time in the order they were added. Returns where the meal landed.
 static int insertMeal(const Meal& meal) {
     int at = numMeals;
-    while (at > 0 && meals[at - 1].timeOfDay > meal.timeOfDay) at--;
+    while (at > 0) {
+        if (meals[at-1].timeOfDay == meal.timeOfDay) return -1;
+        if (meals[at-1].timeOfDay < meal.timeOfDay) break;
+        at--;
+    }
 
     for (int i = numMeals; i > at; i--) {
         meals[i] = meals[i - 1];
@@ -189,8 +173,6 @@ static int insertMeal(const Meal& meal) {
     return at;
 }
 
-// Drops a meal, closing the gap so the order is preserved and no stale copy is
-// left past the end of the list.
 static void removeMeal(int index) {
     for (int i = index; i < numMeals - 1; i++) {
         meals[i] = meals[i + 1];
@@ -198,8 +180,6 @@ static void removeMeal(int index) {
     numMeals--;
 }
 
-// Writes the schedule to flash. Returns false if it did not stick, so the
-// caller can tell the client its change will not survive a reboot.
 static bool saveSchedule() {
     if (!prefs.putUChar(NVS_KEY_VERSION, SCHEDULE_FORMAT_VERSION)) {
         logLine("WARNING: could not write schedule version to NVS");
@@ -229,8 +209,6 @@ static bool saveSchedule() {
     return true;
 }
 
-// Restores the schedule saved by saveSchedule(). Anything that does not look
-// like a schedule we wrote is discarded rather than trusted.
 static void loadSchedule() {
     uint8_t version = prefs.getUChar(NVS_KEY_VERSION, 0);
     if (version != SCHEDULE_FORMAT_VERSION) {
@@ -267,49 +245,30 @@ static void loadSchedule() {
         meal.timeOfDay = stored[i].timeOfDay;
         meal.lastFiredDay = stored[i].lastFiredDay;
 
-        // Only MEAL_NEVER_FIRED or a real day number mean anything. A negative
-        // day that is not the sentinel is damage, and serviceSchedule() deals
-        // with one that turns out to be in the future.
         if (meal.lastFiredDay < MEAL_NEVER_FIRED) meal.lastFiredDay = MEAL_NEVER_FIRED;
 
-        insertMeal(meal);  // a schedule saved before meals were ordered
+        if (insertMeal(meal) < 0) {
+            logf("Ignoring duplicate meal in schedule");
+        }
     }
 
     logf("Restored %d meal(s) from flash", numMeals);
 }
 
-// Set once NTP (or a pushed POST /api/time) has handed us a believable epoch.
-// Until then the scheduler stays parked.
 bool clockSynced = false;
 
-// Minutes east of UTC for the current instant, daylight saving included.
-// Derived from POSIX_TZ by refreshTzOffset(); never taken from the network.
 long tzOffsetMinutes = 0;
 time_t lastSyncEpoch = 0;
 
-// Asks libc what POSIX_TZ means right now and caches it in the sign and units
-// the rest of the code already works in, so the arithmetic below stays plain.
-// Called every tick, so a switchover is picked up within a second of happening
-// -- including during a network outage, which is the point of a rule over a
-// lookup.
 static void refreshTzOffset() {
     time_t now = time(nullptr);
 
-    // This newlib has no tm_gmtoff and no timegm(), so the offset comes from
-    // the only thing that is always there: the same instant rendered both ways.
-    // localtime_r() applies the zone rule to `now` itself, so unlike handing
-    // mktime() a tm_isdst guess, there is nothing ambiguous about it even an
-    // hour either side of a switchover.
     struct tm local;
     struct tm utc;
     if (!localtime_r(&now, &local) || !gmtime_r(&now, &utc)) return;
 
-    // Every real zone is a whole number of minutes off UTC, so the seconds
-    // always agree and the clock faces are enough to compare.
     long minutes = (local.tm_hour * 60L + local.tm_min) - (utc.tm_hour * 60L + utc.tm_min);
 
-    // The two renderings can land on different dates. A one-day gap is the
-    // ordinary case; a ~365-day gap is the same thing seen across New Year.
     int days = local.tm_yday - utc.tm_yday;
     if (days == 1 || days < -1) {
         minutes += MINUTES_PER_DAY;
@@ -320,8 +279,6 @@ static void refreshTzOffset() {
     tzOffsetMinutes = minutes;
 }
 
-// Local wall-clock seconds: UTC as NTP gave it, shifted by the offset the zone
-// rule says applies to this instant.
 static time_t localNow() {
     return time(nullptr) + tzOffsetMinutes * 60;
 }
@@ -334,10 +291,6 @@ static int localMinuteOfDay(time_t local) {
     return (int)((local % SECONDS_PER_DAY) / 60);
 }
 
-// serviceSchedule() dispenses from loop(), where pumping the web server keeps
-// the API answerable through a long meal. /api/dispense dispenses from inside a
-// request, where re-entering handleClient() would trample the request we have
-// not answered yet.
 static bool dispensingFromRequest = false;
 
 static void motorRun() {
@@ -350,9 +303,6 @@ static void motorStop() {
     digitalWrite(MOTOR_IN2_PIN, LOW);
 }
 
-// Blocks until the sensor has read `level` steadily for the debounce window,
-// or until `deadline` passes. Dispensing a meal takes seconds, so we keep
-// answering HTTP while we wait instead of going deaf for the whole meal.
 static bool waitForSensorLevel(int level, unsigned long deadline) {
     unsigned long stableSince = millis();
 
@@ -366,12 +316,9 @@ static bool waitForSensorLevel(int level, unsigned long deadline) {
             return true;
         }
     }
-
     return false;
 }
 
-// Waits for one portion to go past the sensor, with the motor already running.
-// Returns false if nothing arrived before the timeout.
 static bool dispenseOnePortion(unsigned long timeoutMs) {
     unsigned long deadline = millis() + timeoutMs;
 
@@ -383,8 +330,6 @@ static bool dispenseOnePortion(unsigned long timeoutMs) {
     return waitForSensorLevel(PORTION_SENSOR_ACTIVE_LEVEL, deadline);
 }
 
-// Runs the auger until the sensor has counted out `portions` portions. Returns
-// how many actually arrived, which is short of what was asked on a timeout.
 static int dispensePortions(int portions, unsigned long timeoutMs) {
     int served = 0;
 
@@ -419,13 +364,6 @@ static void MealEvent(const Meal& meal, int minutesLate) {
     logf("MealEvent: served %d of %d portion(s)", served, meal.portions);
 }
 
-// Feeds any meal whose time has arrived and that flash does not already account
-// for. Called once a second from loop(), and a meal fires at most once per local
-// day.
-//
-// This is also the catch-up: a meal whose slot went by while the feeder was down
-// has nothing recorded against today, so the first tick after the clock arrives
-// serves it. Meals are in time order, so a run of them catches up oldest first.
 static void serviceSchedule() {
     if (!clockSynced) return;
 
@@ -434,8 +372,6 @@ static void serviceSchedule() {
     int minute = localMinuteOfDay(local);
 
     for (int i = 0; i < numMeals; i++) {
-        // A settled day in the future is damaged flash, or a clock that has
-        // since moved backwards. Trusting it would park the meal for good.
         if (meals[i].lastFiredDay > today) {
             logf("Meal %d is settled for a day in the future; forgetting that", i);
             meals[i].lastFiredDay = MEAL_NEVER_FIRED;
@@ -443,16 +379,11 @@ static void serviceSchedule() {
 
         if (minute < meals[i].timeOfDay) continue;
 
-        // `<` rather than `!=` so a clock correction that moves us backwards
-        // cannot make a meal fire twice.
         if (!(meals[i].lastFiredDay < today)) continue;
 
         meals[i].lastFiredDay = today;
         MealEvent(meals[i], minute - meals[i].timeOfDay);
 
-        // Written now rather than at the next schedule edit: the whole point of
-        // keeping this is that a restart two minutes from now knows the cat has
-        // already been fed.
         if (!saveSchedule()) {
             logLine("WARNING: fed, but could not record it to flash;"
                     " a restart today may feed this meal again");
@@ -470,10 +401,6 @@ static const char* methodName(HTTPMethod method) {
     }
 }
 
-// Every answer the feeder gives leaves through here, so this is also where each
-// request is logged: one line with who asked, what they asked for, and what
-// they got. Nothing has to remember to log itself, and a request refused before
-// a handler could do anything is on the log like any other.
 static void sendJson(int code, const JsonDocument& doc) {
     logf("%s %s %s -> %d", server.client().remoteIP().toString().c_str(),
          methodName(server.method()), server.uri().c_str(), code);
@@ -493,8 +420,6 @@ static void mealToJson(const Meal& meal, JsonObject obj) {
     obj["timeOfDay"] = meal.timeOfDay;
     obj["portions"] = meal.portions;
 
-    // Without a date these mean nothing, and saying "not fed today" when there
-    // is no today would read as a missed meal.
     if (!clockSynced) return;
 
     obj["fedToday"] = meal.lastFiredDay == localDay(localNow());
@@ -517,9 +442,6 @@ static void clockToJson(JsonObject obj) {
     obj["stale"] = age > CLOCK_STALE_SECONDS;
 }
 
-// Query arguments survive on every content type, so /api/dispense takes them as
-// well as a JSON body: `POST /api/dispense?portions=2` needs no header and no
-// quoting, which is what you want from a shell or a browser bar.
 static bool intArg(const char* name, int& out) {
     if (!server.hasArg(name)) return false;
 
@@ -531,15 +453,8 @@ static bool intArg(const char* name, int& out) {
     return true;
 }
 
-// Reads the request body as JSON. Returns false (and answers the request) when
-// the body is missing or malformed.
 static bool readBody(JsonDocument& doc) {
     if (!server.hasArg("plain")) {
-        // A JSON body only reaches us as "plain" when the request does not
-        // claim to be a form: WebServer appends a form body to the argument
-        // string, where _parseArguments() drops any token with no '=' in it.
-        // So `curl -d '{...}'` without a Content-Type header arrives as
-        // nothing at all, and the message has to say why.
         sendError(400, "Missing request body (JSON needs Content-Type: application/json)");
         return false;
     }
@@ -554,8 +469,6 @@ static bool readBody(JsonDocument& doc) {
     return true;
 }
 
-// Pulls a meal out of a JSON object. Returns false (and answers the request)
-// when a field is missing or out of range.
 // A meal created after its own time today is skipped rather than served: it did
 // not exist when its slot went by, so there is nothing to catch up on. Stamping
 // it with today settles it until tomorrow.
@@ -591,8 +504,6 @@ static bool mealFromJson(JsonObjectConst obj, Meal& meal) {
     return true;
 }
 
-// Parses a meal index from the URL. Returns -1 (and answers the request) when
-// it does not name an existing meal.
 static int mealIndexFromUri() {
     String raw = server.pathArg(0);
     int index = raw.toInt();
@@ -605,7 +516,15 @@ static int mealIndexFromUri() {
     return index;
 }
 
-// GET /api/settings -> every meal the feeder is scheduled to serve.
+static int mealIndexAtTime(int timeOfDay) {
+    for (int i = 0; i < numMeals; i++) {
+        if (meals[i].timeOfDay == timeOfDay) return i;
+    }
+
+    return -1;
+}
+
+// GET /api/settings -> get meals and clock sync information
 void handleGetSettings() {
     JsonDocument doc;
     JsonArray arr = doc["meals"].to<JsonArray>();
@@ -615,6 +534,18 @@ void handleGetSettings() {
     }
 
     clockToJson(doc["clock"].to<JsonObject>());
+    sendJson(200, doc);
+}
+
+// GET /api/meals -> every meal the feeder is scheduled to serve.
+void handleGetMeals() {
+    JsonDocument doc;
+    JsonArray arr = doc["meals"].to<JsonArray>();
+
+    for (int i = 0; i < numMeals; i++) {
+        mealToJson(meals[i], arr.add<JsonObject>());
+    }
+
     sendJson(200, doc);
 }
 
@@ -632,7 +563,18 @@ void handleAddMeal() {
     if (!mealFromJson(doc.as<JsonObjectConst>(), meal)) return;
 
     skipIfTimePassed(meal);
+
     int index = insertMeal(meal);
+
+    if (index < 0) {
+        logf("Found existing meal at %02d:%02d. Skipping duplicate.", meal.timeOfDay / 60, meal.timeOfDay % 60);
+        char message[48];
+        snprintf(message, sizeof(message), "Meal already scheduled at %02d:%02d",
+                 meal.timeOfDay / 60, meal.timeOfDay % 60);
+        sendError(400, message);
+        return;
+    }
+
     bool persisted = saveSchedule();
     logf("Added meal %d: %d portions at %d", index, meal.portions, meal.timeOfDay);
 
@@ -643,7 +585,40 @@ void handleAddMeal() {
     sendJson(201, res);
 }
 
-// DELETE /api/meals/<index> -> drop a meal, closing the gap it leaves.
+// PUT /api/meals -> modify a meal.
+void handleModifyMeal() {
+    JsonDocument doc;
+    if (!readBody(doc)) return;
+
+    Meal wanted;
+    if (!mealFromJson(doc.as<JsonObjectConst>(), wanted)) return;
+
+    int index = mealIndexAtTime(wanted.timeOfDay);
+    if (index < 0) {
+        char message[48];
+        snprintf(message, sizeof(message), "No meal scheduled at %02d:%02d",
+                 wanted.timeOfDay / 60, wanted.timeOfDay % 60);
+        sendError(404, message);
+        return;
+    }
+
+    int before = meals[index].portions;
+    meals[index].portions = wanted.portions;
+
+    bool persisted = saveSchedule();
+    logf("Modified meal %d at %02d:%02d: %d portion(s), was %d", index,
+         meals[index].timeOfDay / 60, meals[index].timeOfDay % 60, meals[index].portions,
+         before);
+
+    JsonDocument res;
+    res["index"] = index;
+    res["persisted"] = persisted;
+    res["previousPortions"] = before;
+    mealToJson(meals[index], res["meal"].to<JsonObject>());
+    sendJson(200, res);
+}
+
+// DELETE /api/meals/{} -> delete a meal.
 void handleDeleteMeal() {
     int index = mealIndexFromUri();
     if (index < 0) return;
@@ -660,30 +635,6 @@ void handleDeleteMeal() {
     sendJson(200, res);
 }
 
-// GET /api/time -> what the feeder thinks the time is.
-void handleGetTime() {
-    JsonDocument doc;
-    clockToJson(doc.to<JsonObject>());
-    sendJson(200, doc);
-}
-
-// Reads a UTC epoch out of a pushed request body. Returns nullptr when it is
-// usable, or why it was refused, so the handler can answer with the reason. No
-// timezone is read: the feeder's zone is POSIX_TZ, and a caller who disagrees
-// with it would only be telling the feeder where it is not.
-static const char* timeFromJson(JsonObjectConst obj, long long& epoch) {
-    if (!obj["epoch"].is<long long>()) {
-        return "Expected integer field 'epoch' (seconds since 1970, UTC)";
-    }
-
-    epoch = obj["epoch"];
-    if (epoch < MIN_VALID_EPOCH) return "'epoch' is implausibly far in the past";
-
-    return nullptr;
-}
-
-// The one place the clock is set, whichever way the time arrived. `source` only
-// shapes the log line.
 static void applyTime(long long epoch, const char* source) {
     struct timeval tv;
     tv.tv_sec = (time_t)epoch;
@@ -700,9 +651,6 @@ static void applyTime(long long epoch, const char* source) {
          tzOffsetMinutes / 60, labs(tzOffsetMinutes) % 60);
 }
 
-// Starts SNTP as soon as there is a network, and notices what it has done.
-// SNTP does the asking in a background task on its own schedule, so nothing
-// here waits on a reply: this only ever looks at the clock and moves on.
 static void serviceNtp() {
     static bool started = false;
     static unsigned long lastCheck = 0;
@@ -729,36 +677,10 @@ static void serviceNtp() {
         return;
     }
 
-    // SNTP keeps polling hourly for the rest of the feeder's life, so the clock
-    // stays trued up against the crystal's drift with nobody pushing anything.
-    // Reading COMPLETED clears it, so this is an edge and each sync is seen
-    // once. It is deliberately not logged: a line an hour would bury the log in
-    // noise to say what GET /api/time answers on demand. Missing an edge only
-    // leaves lastSyncEpoch older than it really is, which makes `stale` read
-    // pessimistic rather than wrong in the direction that matters.
     if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) lastSyncEpoch = epoch;
 }
 
-void handleSetTime() {
-    JsonDocument doc;
-    if (!readBody(doc)) return;
-
-    long long epoch = 0;
-    const char* why = timeFromJson(doc.as<JsonObjectConst>(), epoch);
-    if (why) {
-        sendError(400, why);
-        return;
-    }
-
-    applyTime(epoch, "a pushed request");
-
-    JsonDocument res;
-    clockToJson(res.to<JsonObject>());
-    sendJson(200, res);
-}
-
-// POST /api/dispense -> serve portions now, ignoring the schedule and the
-// clock. Body is optional; {"portions": n} defaults to one portion.
+// POST /api/dispense -> serve portions now, ignoring the schedule and clock
 void handleDispense() {
     int portions = 1;
 
@@ -908,11 +830,10 @@ void setup() {
     logLine("Connecting to WiFi in the background");
 
     server.on("/api/settings", HTTP_GET, handleGetSettings);
-    server.on("/api/meals", HTTP_GET, handleGetSettings);
+    server.on("/api/meals", HTTP_GET, handleGetMeals);
     server.on("/api/meals", HTTP_POST, handleAddMeal);
+    server.on("/api/meals", HTTP_PUT, handleModifyMeal);
     server.on(UriBraces("/api/meals/{}"), HTTP_DELETE, handleDeleteMeal);
-    server.on("/api/time", HTTP_GET, handleGetTime);
-    server.on("/api/time", HTTP_POST, handleSetTime);
     server.on("/api/dispense", HTTP_POST, handleDispense);
     server.onNotFound(handleNotFound);
 
