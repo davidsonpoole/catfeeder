@@ -504,24 +504,39 @@ static bool mealFromJson(JsonObjectConst obj, Meal& meal) {
     return true;
 }
 
-static int mealIndexFromUri() {
-    String raw = server.pathArg(0);
-    int index = raw.toInt();
-
-    if (index < 0 || index >= numMeals || (index == 0 && raw != "0")) {
-        sendError(404, "No such meal");
-        return -1;
-    }
-
-    return index;
-}
-
 static int mealIndexAtTime(int timeOfDay) {
     for (int i = 0; i < numMeals; i++) {
         if (meals[i].timeOfDay == timeOfDay) return i;
     }
 
     return -1;
+}
+
+// Parses a meal time (HH:MM) from the URL. Returns -1 (and answers the request)
+// when it is malformed or no meal is scheduled then.
+static int mealIndexFromUri() {
+    String raw = server.pathArg(0);
+    int hours = 0;
+    int minutes = 0;
+    int used = 0;
+
+    if (sscanf(raw.c_str(), "%d:%d%n", &hours, &minutes, &used) != 2 ||
+        used != (int)raw.length() || hours < 0 || hours > 23 || minutes < 0 ||
+        minutes > 59) {
+        sendError(400, "Expected a meal time as HH:MM, e.g. /api/meals/07:30");
+        return -1;
+    }
+
+    int index = mealIndexAtTime(hours * 60 + minutes);
+    if (index < 0) {
+        char message[48];
+        snprintf(message, sizeof(message), "No meal scheduled at %02d:%02d", hours,
+                 minutes);
+        sendError(404, message);
+        return -1;
+    }
+
+    return index;
 }
 
 // GET /api/settings -> get meals and clock sync information
@@ -618,7 +633,7 @@ void handleModifyMeal() {
     sendJson(200, res);
 }
 
-// DELETE /api/meals/{} -> delete a meal.
+// DELETE /api/meals/<HH:MM> -> delete the meal at that time.
 void handleDeleteMeal() {
     int index = mealIndexFromUri();
     if (index < 0) return;
@@ -627,7 +642,7 @@ void handleDeleteMeal() {
     removeMeal(index);
 
     bool persisted = saveSchedule();
-    logf("Deleted meal %d", index);
+    logf("Deleted meal at %02d:%02d", removed.timeOfDay / 60, removed.timeOfDay % 60);
 
     JsonDocument res;
     res["persisted"] = persisted;

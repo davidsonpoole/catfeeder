@@ -18,7 +18,7 @@ else `192.168.1.244`. Add it to your `PATH` or alias it if you use it often.
     catfeeder meals                     list the schedule
     catfeeder meals add 07:30 2         two portions at 07:30 every day
     catfeeder meals modify 07:30 3      make the 07:30 meal three portions
-    catfeeder meals rm 0                delete meal 0
+    catfeeder meals rm 07:30            delete the 07:30 meal
     catfeeder logs                      follow the feeder's log stream
     catfeeder record                    write the log stream to a file per day
 
@@ -75,12 +75,11 @@ Meals are a time of day plus a portion count, up to 8 of them, kept in flash.
 The schedule is always in time order, so a new meal drops into place rather than
 onto the end.
 
-Meals are addressed by their position in that order, which means **adding or
-removing one can renumber the others** — run `catfeeder meals` between edits
-rather than working from a stale listing.
+There can be only one meal at a given time, so meals are addressed by their
+time: adding or removing one never changes how you name the others.
 
-`modify` is the exception: it finds the meal by its time, so it needs no index
-and nothing to be up to date.
+    $ catfeeder meals rm 12:00
+    removed 12:00  1 portion
 
     $ catfeeder meals modify 07:30 3
     modified 07:30  3 portions (was 2)
@@ -93,8 +92,9 @@ rather than quietly turned into a new meal, so a typo cannot add one:
     $ catfeeder meals modify 08:15 3
     catfeeder: no meal scheduled at 08:15 - `catfeeder meals` lists the times
 
-To change a meal's *time*, there is still nothing for it but `rm` and `add`.
-There can be only one meal at a given time, so adding a second is refused:
+`rm` refuses an empty time the same way. To change a meal's *time*, there is
+still nothing for it but `rm` and `add`. Adding a second meal at a time that
+already has one is refused:
 
     $ catfeeder meals add 07:30 2
     catfeeder: there is already a meal at 07:30 - `catfeeder meals modify` changes its portions
@@ -118,8 +118,8 @@ fed today, and that is the end of it. `catfeeder status` shows which are done:
     $ catfeeder status
     clock:  local 14:02, UTC-04:00, synced 1m ago
     meals:  2 scheduled
-      [0] 07:30  2 portions  fed today
-      [1] 12:00  1 portion   fed today
+      07:30  2 portions  fed today
+      12:00  1 portion   fed today
 
 Catch-up is oldest first, since the schedule is in time order. Note that it has
 no window: a feeder that was off from breakfast until the evening serves every
@@ -146,7 +146,7 @@ Everything the feeder logs to its serial console is also broadcast on UDP port
     09:30:00  MealEvent: serving 2 portion(s) (scheduled for 07:30)
     09:30:04  Dispense: portion 1 of 2
     09:31:12  192.168.1.9 POST /api/meals -> 201
-    09:31:40  192.168.1.9 DELETE /api/meals/9 -> 404
+    09:31:40  192.168.1.9 DELETE /api/meals/09:15 -> 404
 
 Every API call is logged that way — who asked, what for, and what they got —
 including the ones refused before a handler ran, so a client getting a 400 shows
