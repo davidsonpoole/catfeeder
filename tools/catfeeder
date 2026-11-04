@@ -185,9 +185,17 @@ def fmt_portions(n):
 
 
 def clock_lines(clock):
+    if clock.get("guessed"):
+        return ["clock:  GUESSED local {}, UTC{} - NTP has not answered, so meals"
+                " follow the feeder's own clock (late by however long the power"
+                " was off)".format(
+                    fmt_minutes(clock["localMinuteOfDay"]),
+                    fmt_offset(clock.get("tzOffsetMinutes", 0)))]
+
     if not clock.get("synced"):
-        return ["clock:  NOT SYNCED - the feeder will not feed until NTP answers"
-                " (needs a route to the internet)"]
+        return ["clock:  NOT SYNCED - no meals until NTP answers, or for {} more"
+                " before the feeder guesses (NTP needs a route to the internet)"
+                .format(fmt_age(clock.get("guessInSeconds", 0)))]
 
     line = "clock:  local {}, UTC{}, synced {} ago".format(
         fmt_minutes(clock["localMinuteOfDay"]),

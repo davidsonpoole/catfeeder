@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <esp_sntp.h>
+#include <esp_timer.h>
 #include <stdarg.h>
 #include <sys/time.h>
 #include <time.h>
@@ -55,6 +56,20 @@
 // loop() looks at what it has done.
 #define NTP_CHECK_INTERVAL_MS 1000
 
+// How often SNTP re-polls once it has a time. Until the first answer it retries
+// on its own, every 15s backing off to 150s, and never gives up.
+#define NTP_SYNC_INTERVAL_MS (60UL * 60 * 1000)
+
+// How long to wait for NTP after boot before feeding by the feeder's own best
+// guess at the time: 100 attempts at the WiFi retry interval, about 50 minutes.
+// A meal at roughly the right time beats no meal; SNTP keeps trying regardless.
+#define CLOCK_GUESS_AFTER_MS (100UL * WIFI_RETRY_INTERVAL_MS)
+
+// How often the time is written to flash, so a feeder back from a power cut
+// with no network can guess from where it left off rather than from nothing.
+// NVS levels its wear, so this costs each page a few erases a week.
+#define CLOCK_SAVE_INTERVAL_MS (10UL * 60 * 1000)
+
 // Log lines are broadcast too, so a viewer can come and go without the feeder
 // knowing or caring, and a missing listener can never block the scheduler.
 #define LOG_PORT 3957
@@ -100,6 +115,8 @@
 #define NVS_NAMESPACE "catfeeder"
 #define NVS_KEY_VERSION "ver"
 #define NVS_KEY_MEALS "meals"
+#define NVS_KEY_GUESSED "guessed"  // bitmask over the stored meals: stampGuessed
+#define NVS_KEY_CLOCK "clock"      // last known UTC epoch, synced or guessed
 #define SCHEDULE_FORMAT_VERSION 2
 
 typedef struct {
@@ -107,6 +124,10 @@ typedef struct {
     int portions;
     int timeOfDay;    // minutes since local midnight
     long lastFiredDay;
+
+    // lastFiredDay was stamped while the clock was only a guess, so it counts
+    // days on the guessed clock and has to be moved once the real time is known.
+    bool stampGuessed;
 
 } Meal;
 
@@ -194,15 +215,24 @@ static bool saveSchedule() {
     }
 
     StoredMeal stored[MAX_MEALS];
+    uint8_t guessed = 0;
     for (int i = 0; i < numMeals; i++) {
         stored[i].portions = (int16_t)meals[i].portions;
         stored[i].timeOfDay = (int16_t)meals[i].timeOfDay;
         stored[i].lastFiredDay = (int32_t)meals[i].lastFiredDay;
+        if (meals[i].stampGuessed) guessed |= 1 << i;
     }
 
     size_t bytes = (size_t)numMeals * sizeof(StoredMeal);
     if (prefs.putBytes(NVS_KEY_MEALS, stored, bytes) != bytes) {
         logLine("WARNING: could not persist meal schedule to NVS");
+        return false;
+    }
+
+    // A separate key rather than a field, so the stored layout and every saved
+    // schedule stay as they are.
+    if (!prefs.putUChar(NVS_KEY_GUESSED, guessed)) {
+        logLine("WARNING: could not persist guessed-clock flags to NVS");
         return false;
     }
 
@@ -232,6 +262,8 @@ static void loadSchedule() {
         return;
     }
 
+    uint8_t guessed = prefs.getUChar(NVS_KEY_GUESSED, 0);
+
     int count = (int)(bytes / sizeof(StoredMeal));
     for (int i = 0; i < count; i++) {
         if (stored[i].timeOfDay < 0 || stored[i].timeOfDay >= MINUTES_PER_DAY ||
@@ -244,6 +276,7 @@ static void loadSchedule() {
         meal.portions = stored[i].portions;
         meal.timeOfDay = stored[i].timeOfDay;
         meal.lastFiredDay = stored[i].lastFiredDay;
+        meal.stampGuessed = (guessed >> i) & 1;
 
         if (meal.lastFiredDay < MEAL_NEVER_FIRED) meal.lastFiredDay = MEAL_NEVER_FIRED;
 
@@ -257,11 +290,31 @@ static void loadSchedule() {
 
 bool clockSynced = false;
 
+// Set when NTP has not answered within CLOCK_GUESS_AFTER_MS of boot. Meals are
+// then served by guessBase plus the time since boot: the last time saved to
+// flash, so late by however long the power was off, but at the right intervals.
+bool clockGuessed = false;
+time_t guessBase = 0;
+
 long tzOffsetMinutes = 0;
 time_t lastSyncEpoch = 0;
 
+static bool clockKnown() {
+    return clockSynced || clockGuessed;
+}
+
+static time_t uptimeSeconds() {
+    return (time_t)(esp_timer_get_time() / 1000000);
+}
+
+// UTC as best the feeder knows it. Before NTP, the system clock only counts up
+// from boot, so the guess is kept apart from it rather than written into it.
+static time_t utcNow() {
+    return clockSynced ? time(nullptr) : guessBase + uptimeSeconds();
+}
+
 static void refreshTzOffset() {
-    time_t now = time(nullptr);
+    time_t now = utcNow();
 
     struct tm local;
     struct tm utc;
@@ -280,7 +333,7 @@ static void refreshTzOffset() {
 }
 
 static time_t localNow() {
-    return time(nullptr) + tzOffsetMinutes * 60;
+    return utcNow() + tzOffsetMinutes * 60;
 }
 
 static long localDay(time_t local) {
@@ -365,16 +418,20 @@ static void MealEvent(const Meal& meal, int minutesLate) {
 }
 
 static void serviceSchedule() {
-    if (!clockSynced) return;
+    if (!clockKnown()) return;
 
     time_t local = localNow();
     long today = localDay(local);
     int minute = localMinuteOfDay(local);
 
     for (int i = 0; i < numMeals; i++) {
-        if (meals[i].lastFiredDay > today) {
+        // Tomorrow is allowed: a meal served on a guessed clock can stand in for
+        // tomorrow's (see settleGuessedMeals()), and a guessed clock restored
+        // from flash can trail a meal stamped just after it was last saved.
+        if (meals[i].lastFiredDay > today + 1) {
             logf("Meal %d is settled for a day in the future; forgetting that", i);
             meals[i].lastFiredDay = MEAL_NEVER_FIRED;
+            meals[i].stampGuessed = false;
         }
 
         if (minute < meals[i].timeOfDay) continue;
@@ -382,6 +439,7 @@ static void serviceSchedule() {
         if (!(meals[i].lastFiredDay < today)) continue;
 
         meals[i].lastFiredDay = today;
+        meals[i].stampGuessed = !clockSynced;
         MealEvent(meals[i], minute - meals[i].timeOfDay);
 
         if (!saveSchedule()) {
@@ -420,24 +478,32 @@ static void mealToJson(const Meal& meal, JsonObject obj) {
     obj["timeOfDay"] = meal.timeOfDay;
     obj["portions"] = meal.portions;
 
-    if (!clockSynced) return;
+    if (!clockKnown()) return;
 
     obj["fedToday"] = meal.lastFiredDay == localDay(localNow());
 }
 
 static void clockToJson(JsonObject obj) {
     obj["synced"] = clockSynced;
+    obj["guessed"] = clockGuessed;
     obj["tzOffsetMinutes"] = tzOffsetMinutes;
     obj["tz"] = POSIX_TZ;
 
-    if (!clockSynced) return;
+    if (!clockKnown()) {
+        long left = (long)CLOCK_GUESS_AFTER_MS - (long)millis();
+        obj["guessInSeconds"] = left > 0 ? left / 1000 : 0;
+        return;
+    }
 
-    time_t now = time(nullptr);
+    time_t now = utcNow();
     time_t local = localNow();
-    long age = (long)(now - lastSyncEpoch);
 
     obj["epoch"] = (long long)now;
     obj["localMinuteOfDay"] = localMinuteOfDay(local);
+
+    if (!clockSynced) return;
+
+    long age = (long)(now - lastSyncEpoch);
     obj["secondsSinceSync"] = age;
     obj["stale"] = age > CLOCK_STALE_SECONDS;
 }
@@ -473,10 +539,13 @@ static bool readBody(JsonDocument& doc) {
 // not exist when its slot went by, so there is nothing to catch up on. Stamping
 // it with today settles it until tomorrow.
 static void skipIfTimePassed(Meal& meal) {
-    if (!clockSynced) return;
+    if (!clockKnown()) return;
 
     time_t local = localNow();
-    if (localMinuteOfDay(local) >= meal.timeOfDay) meal.lastFiredDay = localDay(local);
+    if (localMinuteOfDay(local) >= meal.timeOfDay) {
+        meal.lastFiredDay = localDay(local);
+        meal.stampGuessed = !clockSynced;
+    }
 }
 
 static bool mealFromJson(JsonObjectConst obj, Meal& meal) {
@@ -501,6 +570,7 @@ static bool mealFromJson(JsonObjectConst obj, Meal& meal) {
     meal.timeOfDay = timeOfDay;
     meal.portions = portions;
     meal.lastFiredDay = MEAL_NEVER_FIRED;
+    meal.stampGuessed = false;
     return true;
 }
 
@@ -650,20 +720,85 @@ void handleDeleteMeal() {
     sendJson(200, res);
 }
 
+static void saveClock() {
+    prefs.putLong64(NVS_KEY_CLOCK, (int64_t)utcNow());
+}
+
+// Moves every day stamped on the guessed clock onto the real one, now that we
+// know how far out the guess was. Each meal served on the guess stands in for
+// whichever of its real slots it fell closest to, so the cat is never fed the
+// same meal twice within twelve hours: a breakfast served at 01:30 real time is
+// today's breakfast and 07:30 is skipped; one served at 21:30 is tomorrow's.
+static void settleGuessedMeals(time_t jumpSeconds) {
+    long shift = (long)((jumpSeconds >= 0 ? jumpSeconds + SECONDS_PER_DAY / 2
+                                          : jumpSeconds - SECONDS_PER_DAY / 2) /
+                        SECONDS_PER_DAY);
+    int moved = 0;
+
+    for (int i = 0; i < numMeals; i++) {
+        if (!meals[i].stampGuessed) continue;
+
+        meals[i].stampGuessed = false;
+        if (meals[i].lastFiredDay == MEAL_NEVER_FIRED) continue;
+
+        meals[i].lastFiredDay += shift;
+        moved++;
+    }
+
+    logf("The guessed clock was %+ld minute(s) out; moved %d meal record(s) by %+ld day(s)",
+         (long)(jumpSeconds / 60), moved, shift);
+
+    if (moved > 0 && !saveSchedule()) {
+        logLine("WARNING: could not record settled meals to flash;"
+                " a restart today may feed them again");
+    }
+}
+
 static void applyTime(long long epoch, const char* source) {
+    bool wasGuessed = clockGuessed;
+    time_t guessedLocal = localNow();
+
     struct timeval tv;
     tv.tv_sec = (time_t)epoch;
     tv.tv_usec = 0;
     settimeofday(&tv, nullptr);
 
-    refreshTzOffset();  // the zone rule, now that there is an instant to apply it to
     lastSyncEpoch = (time_t)epoch;
     clockSynced = true;
+    clockGuessed = false;
+    refreshTzOffset();  // the zone rule, now that there is an instant to apply it to
 
     time_t local = localNow();
     logf("Clock synced from %s: local time %02d:%02d (UTC%+ld:%02ld)", source,
          localMinuteOfDay(local) / 60, localMinuteOfDay(local) % 60,
          tzOffsetMinutes / 60, labs(tzOffsetMinutes) % 60);
+
+    if (wasGuessed) settleGuessedMeals(local - guessedLocal);
+    saveClock();
+}
+
+// Falls back to the guessed clock once NTP has had long enough, and keeps the
+// last known time in flash for the next boot to guess from.
+static void serviceClock() {
+    static unsigned long lastSave = 0;
+
+    if (!clockKnown() && millis() >= CLOCK_GUESS_AFTER_MS) {
+        clockGuessed = true;
+        refreshTzOffset();
+
+        time_t local = localNow();
+        logf("No NTP after %lu min; feeding by a guessed clock, local %02d:%02d."
+             " Still asking NTP.",
+             CLOCK_GUESS_AFTER_MS / 60000, localMinuteOfDay(local) / 60,
+             localMinuteOfDay(local) % 60);
+    }
+
+    // Unsigned arithmetic, so millis() rollover is fine.
+    unsigned long now = millis();
+    if (now - lastSave < CLOCK_SAVE_INTERVAL_MS) return;
+
+    lastSave = now;
+    saveClock();
 }
 
 static void serviceNtp() {
@@ -675,6 +810,7 @@ static void serviceNtp() {
 
     if (!started) {
         started = true;
+        sntp_set_sync_interval(NTP_SYNC_INTERVAL_MS);
         configTzTime(POSIX_TZ, NTP_SERVER_1, NTP_SERVER_2);
         logf("Asking %s for the time, zone %s", NTP_SERVER_1, POSIX_TZ);
     }
@@ -831,6 +967,10 @@ void setup() {
 
     if (prefs.begin(NVS_NAMESPACE, false)) {
         loadSchedule();
+
+        // Where a guessed clock starts, should NTP not answer: the last time
+        // this feeder knew, behind by however long the power was off.
+        guessBase = (time_t)prefs.getLong64(NVS_KEY_CLOCK, 0) - uptimeSeconds();
     } else {
         logLine("WARNING: could not open NVS; schedule will not persist");
     }
@@ -856,7 +996,8 @@ void setup() {
     logf("Listening for HTTP on port %d", HTTP_PORT);
 
     logf("Streaming logs to UDP port %d", LOG_PORT);
-    logLine("Clock not set: no meal will be served until NTP answers");
+    logf("Clock not set: meals wait for NTP, or %lu min until the feeder guesses",
+         CLOCK_GUESS_AFTER_MS / 60000);
 }
 
 void loop() {
@@ -866,6 +1007,7 @@ void loop() {
     server.handleClient();
     if (otaReady) ArduinoOTA.handle();
     serviceNtp();
+    serviceClock();
 
     static unsigned long lastCheck = 0;
     unsigned long now = millis();

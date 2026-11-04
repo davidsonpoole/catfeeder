@@ -45,15 +45,31 @@ sensor (100-60000, default 10000).
 ### The clock
 
 The feeder has no RTC battery, so after a power cut it has no idea what time it
-is and **will not feed until it has one**:
+is and **holds every meal until it has one**:
 
     $ catfeeder status
-    clock:  NOT SYNCED - the feeder will not feed until NTP answers (needs a route to the internet)
+    clock:  NOT SYNCED - no meals until NTP answers, or for 48m more before the feeder guesses (NTP needs a route to the internet)
 
 It fixes that itself. Once WiFi is up it asks `pool.ntp.org` for the time over
-NTP, and keeps asking in the background for the rest of its life, so the clock
-is also trued up against the crystal's drift without anyone doing anything. A
-clock last synced over 14 days ago shows `[STALE]`.
+NTP. Until the first answer it retries every 15 seconds, backing off to every
+150, and never gives up. Once it has an answer it re-polls hourly for the rest of
+its life, so the clock is also trued up against the crystal's drift without
+anyone doing anything. A clock last synced over 14 days ago shows `[STALE]`.
+
+**If NTP has not answered 50 minutes after boot,** the feeder stops waiting and
+feeds by a guessed clock. Every 10 minutes it writes the time to flash, and
+after a power cut the guess picks up from the last time it saved. The guess
+runs late by however long the power was off, but meals still come at the right
+intervals:
+
+    $ catfeeder status
+    clock:  GUESSED local 06:12, UTC-05:00 - NTP has not answered, so meals follow the feeder's own clock (late by however long the power was off)
+
+It keeps asking NTP the whole time. When the real time arrives, each meal served
+on the guessed clock counts for whichever real mealtime it was closest to, so
+nothing is served twice. With a 07:30 breakfast, if the guess served it at 01:30
+real time, that was today's breakfast and 07:30 is skipped. If it served it at
+21:30, that was tomorrow's breakfast.
 
 NTP answers in UTC only. The feeder turns that into local time using a zone
 rule compiled into the firmware, `POSIX_TZ` in `src/main.cpp`:
